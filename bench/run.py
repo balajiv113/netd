@@ -84,17 +84,23 @@ class QGA:
 
     def _recv(self, timeout):
         self.sock.settimeout(timeout)
-        while b"\n" not in self.buf:
-            d = self.sock.recv(1 << 20)
-            if not d:
-                raise ConnectionError("qga closed")
-            self.buf += d
-        line, self.buf = self.buf.split(b"\n", 1)
-        return json.loads(line)
+        while True:
+            while b"\n" not in self.buf:
+                d = self.sock.recv(1 << 20)
+                if not d:
+                    raise ConnectionError("qga closed")
+                self.buf += d
+            line, self.buf = self.buf.split(b"\n", 1)
+            # guest-sync-delimited prefixes its reply with a 0xFF sentinel.
+            line = line.lstrip(b"\xff").strip()
+            if line:
+                return json.loads(line)
 
-    def wait(self, timeout=240):
+    def wait(self, timeout=240, proc=None, console=None):
         end = time.time() + timeout
         while time.time() < end:
+            if proc is not None and proc.poll() is not None:
+                raise RuntimeError(f"qemu exited with {proc.returncode}")
             try:
                 self._connect()
                 self.seq += 1
@@ -108,7 +114,13 @@ class QGA:
                         return
             except (OSError, ValueError, ConnectionError):
                 time.sleep(1)
-        raise RuntimeError("guest agent did not come up")
+        tail = ""
+        if console:
+            try:
+                tail = "\n".join(Path(console).read_text(errors="replace").splitlines()[-15:])
+            except OSError:
+                pass
+        raise RuntimeError(f"guest agent did not come up; console tail:\n{tail}")
 
     def cmd(self, execute, args=None, timeout=30):
         msg = {"execute": execute}
@@ -413,7 +425,7 @@ def run_contender(name, args):
         qp = c.spawn(qemu, f"{name}-qemu")
         wait_path(qga_path)
         g = QGA(qga_path)
-        g.wait()
+        g.wait(proc=qp, console=W / f"{name}-console.log")
         log(f"[{name}] guest up")
         c.guest_setup(g)
         pids = {"qemu": qp.pid}
