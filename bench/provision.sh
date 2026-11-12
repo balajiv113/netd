@@ -19,7 +19,10 @@ cat >"$W/user-data" <<'EOF'
 #cloud-config
 package_update: true
 packages: [iperf3, qemu-guest-agent, iptables]
+bootcmd:
+  - echo BOOTCMD_REACHED > /dev/ttyS0
 runcmd:
+  - echo RUNCMD_START > /dev/ttyS0
   - curl -fsS -o /usr/local/bin/netd-agent http://10.0.2.2:8765/netd-agent
   - curl -fsS -o /usr/local/bin/nbench http://10.0.2.2:8765/nbench
   - chmod +x /usr/local/bin/netd-agent /usr/local/bin/nbench
@@ -40,17 +43,26 @@ cloud-localds "$W/seed.img" "$W/user-data" "$W/meta-data"
 
 python3 -m http.server 8765 --bind 127.0.0.1 --directory "$W" >/dev/null 2>&1 &
 HTTP_PID=$!
-trap 'kill $HTTP_PID 2>/dev/null || true' EXIT
 
 ACCEL=kvm
 [ -w /dev/kvm ] || ACCEL=tcg
-timeout "${PROVISION_TIMEOUT:-1200}" qemu-system-x86_64 \
+echo "provisioning with accel=$ACCEL"
+: >"$W/provision.log"
+tail -f "$W/provision.log" &
+TAIL_PID=$!
+trap 'kill $HTTP_PID $TAIL_PID 2>/dev/null || true' EXIT
+
+rc=0
+timeout "${PROVISION_TIMEOUT:-600}" qemu-system-x86_64 \
   -machine q35,accel=$ACCEL -cpu max -smp 2 -m 2048 -nodefaults -display none \
   -drive file="$W/base.qcow2",if=virtio \
   -drive file="$W/seed.img",if=virtio,format=raw \
   -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-  -serial file:"$W/provision.log"
+  -serial file:"$W/provision.log" || rc=$?
+sleep 1
 
-grep -q PROVISION_DONE "$W/provision.log" || { echo "provisioning failed"; tail -50 "$W/provision.log"; exit 1; }
-grep -E 'MOD_(DUMMY|VSOCK)_OK' "$W/provision.log" || true
+if [ $rc -ne 0 ] || ! grep -q PROVISION_DONE "$W/provision.log"; then
+  echo "provisioning failed (qemu exit $rc)"
+  exit 1
+fi
 echo "base image ready: $W/base.qcow2"
