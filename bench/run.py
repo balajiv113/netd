@@ -36,6 +36,8 @@ NBENCH_PORT = 7000
 TAP = "nbtap0"
 
 ALL = ["native", "tap-vhost", "slirp", "gvproxy", "passt", "passt-vu", "netd-vu", "netd-kvsock"]
+NETD = ["netd-vu", "netd-kvsock"]
+BASELINE = Path(__file__).resolve().parent / "baseline" / "linux-kvm.json"
 
 
 def log(*a):
@@ -434,7 +436,8 @@ def run_contender(name, args):
 
         for t, extra in THROUGHPUT.items():
             def go():
-                _, out, err = g.run(iperf_args(c.host_ip, 5201, extra, args.secs), check=False)
+                _, out, err = g.run(["timeout", "-k", "5", str(args.secs + 20)] + iperf_args(c.host_ip, 5201, extra, args.secs),
+                                   timeout=args.secs + 40, check=False)
                 return iperf_gbps(out or err)
             try:
                 v, cpu = measure(go, list(pids.values()))
@@ -448,7 +451,7 @@ def run_contender(name, args):
 
         for t, argv in {"rr": ["rr", f"{c.host_ip}:{NBENCH_PORT}", "20000"],
                         "crr": ["crr", f"{c.host_ip}:{NBENCH_PORT}", "5"]}.items():
-            rc, out, err = g.run(["/usr/local/bin/nbench"] + argv, check=False)
+            rc, out, err = g.run(["timeout", "-k", "5", "60", "/usr/local/bin/nbench"] + argv, timeout=80, check=False)
             try:
                 res[t] = json.loads(out)
             except ValueError:
@@ -461,12 +464,18 @@ def run_contender(name, args):
             time.sleep(0.5)
             host, port = c.setup_forward(g)
             time.sleep(0.5)
-            out = subprocess.run(iperf_args(host, port, [], args.secs), capture_output=True, text=True).stdout
+            out = subprocess.run(iperf_args(host, port, ["--connect-timeout", "5000"], args.secs),
+                                 capture_output=True, text=True, timeout=args.secs + 30).stdout
             res["fwd1"] = iperf_gbps(out)
         except Exception as e:
             res["fwd1"] = None
             res["fwd1_error"] = str(e)[:300]
         log(f"[{name}] fwd1: {res['fwd1']}")
+        try:
+            _, out, _ = g.run("cat /var/log/netd-agent.log 2>/dev/null; echo ---; dmesg | tail -50", timeout=20, check=False)
+            (W / f"{name}-guest.log").write_text(out)
+        except Exception:
+            pass
         try:
             g.cmd("guest-shutdown", timeout=5)
         except Exception:
@@ -520,11 +529,15 @@ def report(results):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("contenders", nargs="*", default=ALL)
+    ap.add_argument("contenders", nargs="*", default=NETD,
+                    help="default: netd only; other contenders come from the frozen baseline ('all' = rerun everything)")
+    ap.add_argument("--baseline", default=str(BASELINE), help="frozen results merged into the report ('' = none)")
     ap.add_argument("--secs", type=int, default=10)
     ap.add_argument("--vcpus", type=int, default=2)
     ap.add_argument("--out", default=str(W / "results.json"))
     args = ap.parse_args()
+    if args.contenders == ["all"]:
+        args.contenders = ALL
 
     if not (W / "base.qcow2").exists():
         sys.exit("run bench/provision.sh first")
@@ -540,7 +553,12 @@ def main():
     finally:
         server.terminate()
         nb.terminate()
-    md = report(results)
+    merged = {}
+    if args.baseline and Path(args.baseline).exists():
+        merged = {k: dict(v, mtu=v.get("mtu", "host loopback") + " [baseline]") if k != "native" else v
+                  for k, v in json.loads(Path(args.baseline).read_text()).items() if k not in results}
+    merged.update(results)
+    md = report(merged)
     print(md)
     (W / "results.md").write_text(md + "\n")
     if os.environ.get("GITHUB_STEP_SUMMARY"):

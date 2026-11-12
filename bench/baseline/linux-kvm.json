@@ -1,0 +1,204 @@
+{
+  "native": {
+    "up1": 22.3,
+    "down1": 22.1,
+    "up4": 43.52,
+    "down4": 42.75,
+    "rr": {
+      "count": 20000,
+      "size": 64,
+      "avg_us": 35.39,
+      "p50_us": 34.45,
+      "p99_us": 63.83,
+      "tps": 28256
+    },
+    "crr": {
+      "conns": 31544,
+      "errors": 0,
+      "secs": 5.0,
+      "conn_per_sec": 6309
+    }
+  },
+  "tap-vhost": {
+    "mtu": "1500 (privileged: tap + vhost-net)",
+    "up1": 16.63,
+    "up1_cpu": {
+      "qemu": 1.66
+    },
+    "down1": 17.98,
+    "down1_cpu": {
+      "qemu": 1.42
+    },
+    "up4": 19.47,
+    "up4_cpu": {
+      "qemu": 1.6
+    },
+    "down4": 15.13,
+    "down4_cpu": {
+      "qemu": 1.46
+    },
+    "rr": {
+      "count": 20000,
+      "size": 64,
+      "avg_us": 126.51,
+      "p50_us": 118.67,
+      "p99_us": 294.69,
+      "tps": 7905
+    },
+    "crr": {
+      "conns": 9565,
+      "errors": 0,
+      "secs": 5.0,
+      "conn_per_sec": 1913
+    },
+    "fwd1": 17.55
+  },
+  "slirp": {
+    "mtu": "1500",
+    "up1": 0.44,
+    "up1_cpu": {
+      "qemu": 1.66
+    },
+    "down1": 1.92,
+    "down1_cpu": {
+      "qemu": 1.86
+    },
+    "up4": 0.52,
+    "up4_cpu": {
+      "qemu": 1.55
+    },
+    "down4": 3.29,
+    "down4_cpu": {
+      "qemu": 1.82
+    },
+    "rr": {
+      "count": 20000,
+      "size": 64,
+      "avg_us": 212.7,
+      "p50_us": 204.6,
+      "p99_us": 340.3,
+      "tps": 4701
+    },
+    "crr": {
+      "conns": 4645,
+      "errors": 0,
+      "secs": 5.0,
+      "conn_per_sec": 929
+    },
+    "fwd1": 1.38
+  },
+  "gvproxy": {
+    "mtu": "1500 (gvproxy default)",
+    "up1": 0.89,
+    "up1_cpu": {
+      "qemu": 0.97,
+      "gvproxy": 0.89
+    },
+    "down1": 0.67,
+    "down1_cpu": {
+      "qemu": 0.94,
+      "gvproxy": 0.9
+    },
+    "up4": 0.97,
+    "up4_cpu": {
+      "qemu": 0.76,
+      "gvproxy": 1.07
+    },
+    "down4": 0.72,
+    "down4_cpu": {
+      "qemu": 0.96,
+      "gvproxy": 0.95
+    },
+    "rr": {
+      "count": 20000,
+      "size": 64,
+      "avg_us": 424.14,
+      "p50_us": 417.76,
+      "p99_us": 638.91,
+      "tps": 2358
+    },
+    "crr": {
+      "conns": 3126,
+      "errors": 0,
+      "secs": 72.11,
+      "conn_per_sec": 43
+    },
+    "fwd1": 0.69
+  },
+  "passt": {
+    "mtu": "65520 (passt default)",
+    "up1": 6.37,
+    "up1_cpu": {
+      "qemu": 1.33,
+      "passt": 0.42
+    },
+    "down1": 6.1,
+    "down1_cpu": {
+      "qemu": 1.23,
+      "passt": 0.55
+    },
+    "up4": 7.22,
+    "up4_cpu": {
+      "qemu": 1.19,
+      "passt": 0.51
+    },
+    "down4": 5.72,
+    "down4_cpu": {
+      "qemu": 1.21,
+      "passt": 0.58
+    },
+    "rr": {
+      "count": 20000,
+      "size": 64,
+      "avg_us": 354.29,
+      "p50_us": 351.01,
+      "p99_us": 551.86,
+      "tps": 2823
+    },
+    "crr": {
+      "conns": 4853,
+      "errors": 0,
+      "secs": 5.0,
+      "conn_per_sec": 970
+    },
+    "fwd1": 6.22
+  },
+  "passt-vu": {
+    "mtu": "65520 (passt default, vhost-user)",
+    "up1": 5.29,
+    "up1_cpu": {
+      "qemu": 1.26,
+      "passt": 0.46
+    },
+    "down1": 13.84,
+    "down1_cpu": {
+      "qemu": 1.01,
+      "passt": 0.46
+    },
+    "up4": 10.19,
+    "up4_cpu": {
+      "qemu": 1.22,
+      "passt": 0.48
+    },
+    "down4": 7.78,
+    "down4_cpu": {
+      "qemu": 0.96,
+      "passt": 0.78
+    },
+    "rr": {
+      "count": 20000,
+      "size": 64,
+      "avg_us": 210.77,
+      "p50_us": 208.64,
+      "p99_us": 319.49,
+      "tps": 4744
+    },
+    "crr": {
+      "conns": 6740,
+      "errors": 0,
+      "secs": 5.0,
+      "conn_per_sec": 1348
+    },
+    "fwd1": 13.36
+  }
+}

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       contenders:
-        description: "space separated (empty = all)"
+        description: "space separated (empty = netd only vs frozen baseline; 'all' = rerun everything)"
         required: false
         default: ""
       secs:
@@ -69,11 +69,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/vhost-device-vsock
-          key: vhost-device-vsock-0.3.0-${{ runner.os }}
+          key: vhost-device-vsock-0484a75-${{ hashFiles('bench/patches/vhost-device-vsock-*.patch') }}-${{ runner.os }}
 
-      - name: Install vhost-device-vsock
+      # Upstream main + local fix for stranded guest->host data on EPOLLIN|EPOLLOUT
+      # (see bench/patches). 0.3.0 and main both stall netd-vu without it.
+      - name: Install vhost-device-vsock (patched)
         if: steps.vdv.outputs.cache-hit != 'true'
-        run: cargo install vhost-device-vsock --version 0.3.0 --locked
+        run: |
+          git clone -q https://github.com/rust-vmm/vhost-device "$RUNNER_TEMP/vdv"
+          cd "$RUNNER_TEMP/vdv" && git checkout -q 0484a75df5c8e77a708af10b24dd34f596b25084
+          git apply "$GITHUB_WORKSPACE"/bench/patches/vhost-device-vsock-*.patch
+          cargo install --locked --path vhost-device-vsock
 
       - name: Build netd
         run: |

@@ -1,0 +1,74 @@
+diff --git a/vhost-device-vsock/src/vhu_vsock_thread.rs b/vhost-device-vsock/src/vhu_vsock_thread.rs
+index 74b05e8..09af875 100644
+--- a/vhost-device-vsock/src/vhu_vsock_thread.rs
++++ b/vhost-device-vsock/src/vhu_vsock_thread.rs
+@@ -444,7 +444,10 @@ impl VhostUserVsockThread {
+                 let key = self.thread_backend.listener_map.get(&fd).unwrap();
+                 let conn = self.thread_backend.conn_map.get_mut(key).unwrap();
+ 
+-                if evset.bits() == epoll::Events::EPOLLOUT.bits() {
++                // EPOLLOUT may arrive together with EPOLLIN/EPOLLHUP; always flush
++                // pending guest->host data first, otherwise it is stranded once
++                // the fd is unregistered below and the guest runs out of credit.
++                if evset.contains(epoll::Events::EPOLLOUT) {
+                     // Flush any remaining data from the tx buffer
+                     match conn.tx_buf.flush_to(&mut conn.stream) {
+                         Ok(cnt) => {
+@@ -466,7 +469,9 @@ impl VhostUserVsockThread {
+                             log::debug!("Error: {e:?}");
+                         }
+                     }
+-                    return;
++                    if !evset.intersects(epoll::Events::EPOLLIN | epoll::Events::EPOLLHUP | epoll::Events::EPOLLERR) {
++                        return;
++                    }
+                 }
+ 
+                 // Unregister stream from the epoll, register when connection is
+diff --git a/vhost-device-vsock/src/vsock_conn.rs b/vhost-device-vsock/src/vsock_conn.rs
+index 6f095bc..021e1d2 100644
+--- a/vhost-device-vsock/src/vsock_conn.rs
++++ b/vhost-device-vsock/src/vsock_conn.rs
+@@ -150,6 +150,11 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
+                 // Check if peer has space for receiving data
+                 if self.need_credit_update_from_peer() {
+                     self.last_fwd_cnt = self.fwd_cnt;
++                    // The fd was unregistered before this read; keep flushing
++                    // buffered guest->host data while waiting for peer credit.
++                    if !self.tx_buf.is_empty() {
++                        self.rearm(epoll::Events::EPOLLOUT);
++                    }
+                     pkt.set_op(VSOCK_OP_CREDIT_REQUEST);
+                     return Ok(());
+                 }
+@@ -163,7 +168,13 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
+                     .subslice(0, max_read_len)
+                     .expect("subslicing should work since length was checked");
+                 // Read data from the stream directly into the buffer
+-                if let Ok(read_cnt) = self.stream.read_volatile(&mut buf) {
++                let read = self.stream.read_volatile(&mut buf);
++                if read.is_err() {
++                    // Spurious wakeup (EAGAIN) or error: never leave the fd
++                    // unregistered, or the connection stalls forever.
++                    self.rearm(epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT);
++                }
++                if let Ok(read_cnt) = read {
+                     if read_cnt == 0 {
+                         // If no data was read then the stream was closed down unexpectedly.
+                         // Send a shutdown packet to the guest-side application.
+@@ -220,6 +231,15 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
+         }
+     }
+ 
++    fn rearm(&self, events: epoll::Events) {
++        let fd = self.stream.as_raw_fd();
++        if VhostUserVsockThread::epoll_modify(self.epoll_fd, fd, events).is_err() {
++            if let Err(e) = VhostUserVsockThread::epoll_register(self.epoll_fd, fd, events) {
++                error!("rearm failed: {e:?}");
++            }
++        }
++    }
++
+     /// Deliver a guest generated packet to this connection.
+     ///
+     /// Returns:
