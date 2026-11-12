@@ -28,6 +28,7 @@ jobs:
     timeout-minutes: 90
     env:
       DEBIAN_FRONTEND: noninteractive
+      VDV_LOG: debug
     steps:
       - uses: actions/checkout@v4
 

@@ -1,3 +1,16 @@
+diff --git a/vhost-device-vsock/src/txbuf.rs b/vhost-device-vsock/src/txbuf.rs
+index 77e93c9..0432bc2 100644
+--- a/vhost-device-vsock/src/txbuf.rs
++++ b/vhost-device-vsock/src/txbuf.rs
+@@ -96,7 +96,7 @@ impl LocalTxBuf {
+     }
+ 
+     /// Return amount of data in the buffer.
+-    fn len(&self) -> usize {
++    pub(crate) fn len(&self) -> usize {
+         (self.tail - self.head).0 as usize
+     }
+ }
 diff --git a/vhost-device-vsock/src/vhu_vsock_thread.rs b/vhost-device-vsock/src/vhu_vsock_thread.rs
 index 74b05e8..09af875 100644
 --- a/vhost-device-vsock/src/vhu_vsock_thread.rs
@@ -26,9 +39,18 @@ index 74b05e8..09af875 100644
  
                  // Unregister stream from the epoll, register when connection is
 diff --git a/vhost-device-vsock/src/vsock_conn.rs b/vhost-device-vsock/src/vsock_conn.rs
-index 6f095bc..021e1d2 100644
+index 6f095bc..9b0949f 100644
 --- a/vhost-device-vsock/src/vsock_conn.rs
 +++ b/vhost-device-vsock/src/vsock_conn.rs
+@@ -6,7 +6,7 @@ use std::{
+     os::unix::prelude::{AsRawFd, RawFd},
+ };
+ 
+-use log::{error, info};
++use log::{error, info, warn};
+ use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
+ use vm_memory::{bitmap::BitmapSlice, ReadVolatile, VolatileSlice, WriteVolatile};
+ 
 @@ -150,6 +150,11 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
                  // Check if peer has space for receiving data
                  if self.need_credit_update_from_peer() {
@@ -72,3 +94,19 @@ index 6f095bc..021e1d2 100644
      /// Deliver a guest generated packet to this connection.
      ///
      /// Returns:
+@@ -266,8 +286,13 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
+                     }
+                     Some(buf) => {
+                         if let Err(err) = self.send_bytes(buf) {
+-                            // TODO: Terminate this connection
+-                            log::debug!("err:{err:?}");
++                            // Dropping guest data would corrupt the stream and leak
++                            // credit until the guest stalls; reset the connection.
++                            warn!(
++                                "vsock: tx to host stream failed (lp={}, pp={}, len={}, txbuf={}): {err:?}",
++                                self.local_port, self.peer_port, buf.len(), self.tx_buf.len()
++                            );
++                            self.rx_queue.enqueue(RxOps::Reset);
+                             return Ok(());
+                         }
+                     }

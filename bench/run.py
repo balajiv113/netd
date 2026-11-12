@@ -162,10 +162,11 @@ class Contender:
     def __init__(self, procs):
         self.procs = procs  # list of Popen to stop afterwards
 
-    def spawn(self, argv, name):
-        f = open(W / f"{name}.log", "w")
+    def spawn(self, argv, name, env=None):
+        f = open(W / f"{self.name}-{name}.log" if not name.startswith(self.name) else W / f"{name}.log", "w")
         log("+", " ".join(map(str, argv)))
-        p = subprocess.Popen([str(a) for a in argv], stdout=f, stderr=subprocess.STDOUT)
+        p = subprocess.Popen([str(a) for a in argv], stdout=f, stderr=subprocess.STDOUT,
+                             env=dict(os.environ, **(env or {})))
         self.procs.append(p)
         return p
 
@@ -337,7 +338,7 @@ class NetdVU(Contender):
             (W / s).unlink(missing_ok=True)
         self.spawn([os.environ.get("VHOST_DEVICE_VSOCK", "vhost-device-vsock"), "--vm",
                     f"guest-cid=3,socket={W}/vu-vsock.sock,uds-path={W}/vm.vsock,tx-buffer-size=1048576,queue-size=1024"],
-                   "vhost-device-vsock")
+                   "vhost-device-vsock", env={"RUST_LOG": os.environ.get("VDV_LOG", "warn")})
         self.spawn([BIN / "netd", "--listen-uds", f"{W}/vm.vsock_1024", "--guest-uds", f"{W}/vm.vsock",
                     "--forward", f"127.0.0.1:{FWD_HOST_PORT}={GUEST_IPERF_PORT}"], "netd")
         wait_path(W / "vu-vsock.sock")
