@@ -1,0 +1,246 @@
+//! netd (Linux prototype): socket-offload network daemon.
+//!
+//! Guest connections arrive over vsock (either through vhost-device-vsock's
+//! hybrid Unix socket or the kernel vhost-vsock device), carry an offload
+//! request header and are turned into real host TCP connections. Host port
+//! forwards go the opposite way.
+
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::exit;
+use std::sync::Arc;
+use std::thread;
+
+use netd_common::proto::{self, PROTO_TCP, Request};
+use netd_common::{relay, sock};
+
+const USAGE: &str = "usage: netd [options]
+  --listen-uds PATH        accept guest connections on a Unix socket (vhost-device-vsock: <uds-path>_<port>)
+  --listen-vsock PORT      accept guest connections on AF_VSOCK (kernel vhost-vsock)
+  --guest-uds PATH         reach the guest agent through vhost-device-vsock's <uds-path>
+  --guest-vsock CID        reach the guest agent through AF_VSOCK
+  --guest-port PORT        vsock port of the guest agent's inbound listener (default 1025)
+  --forward ADDR=PORT      forward host TCP ADDR (e.g. 127.0.0.1:8080) to guest port PORT
+  --host-alias IP          guest-visible address that maps to host loopback (repeatable;
+                           default 192.168.5.2 and fd00:5::2)
+  --vsock-buf BYTES        vsock credit window for AF_VSOCK sockets (default 4194304)";
+
+enum GuestPath {
+    Uds(String),
+    Vsock(u32),
+}
+
+struct Config {
+    listen_uds: Vec<String>,
+    listen_vsock: Vec<u32>,
+    guest: Option<GuestPath>,
+    guest_port: u32,
+    forwards: Vec<(SocketAddr, u16)>,
+    aliases: Vec<IpAddr>,
+    vsock_buf: u64,
+}
+
+fn die(m: &str) -> ! {
+    eprintln!("netd: {m}\n{USAGE}");
+    exit(2)
+}
+
+fn parse<T: std::str::FromStr>(v: &str, what: &str) -> T {
+    v.parse().unwrap_or_else(|_| die(&format!("bad {what}: {v}")))
+}
+
+fn parse_args() -> Config {
+    let mut c = Config {
+        listen_uds: vec![],
+        listen_vsock: vec![],
+        guest: None,
+        guest_port: 1025,
+        forwards: vec![],
+        aliases: vec![],
+        vsock_buf: 4 << 20,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "-h" || a == "--help" {
+            println!("{USAGE}");
+            exit(0)
+        }
+        let v = args.next().unwrap_or_else(|| die(&format!("{a} needs a value")));
+        match a.as_str() {
+            "--listen-uds" => c.listen_uds.push(v),
+            "--listen-vsock" => c.listen_vsock.push(parse(&v, "port")),
+            "--guest-uds" => c.guest = Some(GuestPath::Uds(v)),
+            "--guest-vsock" => c.guest = Some(GuestPath::Vsock(parse(&v, "cid"))),
+            "--guest-port" => c.guest_port = parse(&v, "port"),
+            "--forward" => {
+                let (h, g) = v.split_once('=').unwrap_or_else(|| die("--forward wants ADDR=PORT"));
+                c.forwards.push((parse(h, "forward address"), parse(g, "forward port")));
+            }
+            "--host-alias" => c.aliases.push(parse(&v, "alias")),
+            "--vsock-buf" => c.vsock_buf = parse(&v, "size"),
+            _ => die(&format!("unknown option {a}")),
+        }
+    }
+    if c.aliases.is_empty() {
+        c.aliases = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 5, 2)), IpAddr::V6("fd00:5::2".parse().unwrap())];
+    }
+    if c.listen_uds.is_empty() && c.listen_vsock.is_empty() && c.forwards.is_empty() {
+        die("nothing to do");
+    }
+    if !c.forwards.is_empty() && c.guest.is_none() {
+        die("--forward needs --guest-uds or --guest-vsock");
+    }
+    c
+}
+
+fn map_dst(aliases: &[IpAddr], dst: SocketAddr) -> SocketAddr {
+    if aliases.contains(&dst.ip()) {
+        let lo = match dst.ip() {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        };
+        return SocketAddr::new(lo, dst.port());
+    }
+    dst
+}
+
+/// Serve one guest-initiated connection: read the request, connect, relay.
+fn serve_outbound(conn: OwnedFd, aliases: &[IpAddr]) -> io::Result<()> {
+    let mut f = File::from(conn);
+    let req = Request::read_from(&mut f)?;
+    if req.proto != PROTO_TCP {
+        return proto::write_status(&mut f, libc::EPROTONOSUPPORT);
+    }
+    let tcp = match TcpStream::connect(map_dst(aliases, req.dst)) {
+        Ok(t) => t,
+        Err(e) => return proto::write_status(&mut f, e.raw_os_error().unwrap_or(libc::ECONNREFUSED)),
+    };
+    tcp.set_nodelay(true)?;
+    proto::write_status(&mut f, 0)?;
+    relay::relay(f.into(), tcp.into());
+    Ok(())
+}
+
+fn connect_guest(g: &GuestPath, port: u32, vsock_buf: u64) -> io::Result<OwnedFd> {
+    match g {
+        GuestPath::Vsock(cid) => sock::vsock_connect(*cid, port, Some(vsock_buf)),
+        GuestPath::Uds(path) => {
+            // vhost-device-vsock hybrid protocol: "CONNECT <port>\n" -> "OK <host_port>\n"
+            let mut s = UnixStream::connect(path)?;
+            s.write_all(format!("CONNECT {port}\n").as_bytes())?;
+            let mut line = Vec::new();
+            let mut b = [0u8; 1];
+            while b[0] != b'\n' {
+                if s.read(&mut b)? == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "guest closed during CONNECT"));
+                }
+                line.push(b[0]);
+            }
+            if !line.starts_with(b"OK") {
+                return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "guest refused CONNECT"));
+            }
+            Ok(s.into())
+        }
+    }
+}
+
+/// Serve one host-side forwarded connection into the guest.
+fn serve_forward(tcp: TcpStream, cfg: &Config, guest_port: u16) -> io::Result<()> {
+    tcp.set_nodelay(true)?;
+    let g = cfg.guest.as_ref().expect("checked in parse_args");
+    let mut f = File::from(connect_guest(g, cfg.guest_port, cfg.vsock_buf)?);
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), guest_port);
+    f.write_all(&Request::tcp(dst).encode())?;
+    let st = proto::read_status(&mut f)?;
+    if st != 0 {
+        return Err(io::Error::from_raw_os_error(st));
+    }
+    relay::relay(f.into(), tcp.into());
+    Ok(())
+}
+
+fn spawn_acceptor(name: String, listener: OwnedFd, aliases: Arc<Vec<IpAddr>>, vsock_buf: Option<u64>) {
+    thread::spawn(move || {
+        loop {
+            match sock::accept(listener.as_raw_fd()) {
+                Ok(c) => {
+                    if let Some(b) = vsock_buf {
+                        let _ = sock::set_vsock_buffer(c.as_raw_fd(), b);
+                    }
+                    let aliases = aliases.clone();
+                    thread::spawn(move || {
+                        if let Err(e) = serve_outbound(c, &aliases) {
+                            eprintln!("netd: outbound: {e}");
+                        }
+                    });
+                }
+                Err(e) => eprintln!("netd: accept on {name}: {e}"),
+            }
+        }
+    });
+}
+
+fn main() {
+    let cfg = Arc::new(parse_args());
+    let aliases = Arc::new(cfg.aliases.clone());
+
+    for path in &cfg.listen_uds {
+        let _ = std::fs::remove_file(path);
+        let l = UnixListener::bind(path).unwrap_or_else(|e| {
+            eprintln!("netd: bind {path}: {e}");
+            exit(1)
+        });
+        eprintln!("netd: listening for guest connections on {path}");
+        spawn_acceptor(path.clone(), l.into(), aliases.clone(), None);
+    }
+    for &port in &cfg.listen_vsock {
+        let l = sock::vsock_listen(port).unwrap_or_else(|e| {
+            eprintln!("netd: vsock listen {port}: {e}");
+            exit(1)
+        });
+        eprintln!("netd: listening for guest connections on vsock port {port}");
+        spawn_acceptor(format!("vsock:{port}"), l, aliases.clone(), Some(cfg.vsock_buf));
+    }
+    for &(addr, gport) in &cfg.forwards {
+        let l = TcpListener::bind(addr).unwrap_or_else(|e| {
+            eprintln!("netd: forward bind {addr}: {e}");
+            exit(1)
+        });
+        eprintln!("netd: forwarding {addr} -> guest port {gport}");
+        let cfg = cfg.clone();
+        thread::spawn(move || {
+            for c in l.incoming() {
+                match c {
+                    Ok(t) => {
+                        let cfg = cfg.clone();
+                        thread::spawn(move || {
+                            if let Err(e) = serve_forward(t, &cfg, gport) {
+                                eprintln!("netd: forward: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => eprintln!("netd: forward accept: {e}"),
+                }
+            }
+        });
+    }
+    loop {
+        thread::park();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alias_maps_to_loopback() {
+        let aliases = vec!["192.168.5.2".parse().unwrap(), "fd00:5::2".parse().unwrap()];
+        assert_eq!(map_dst(&aliases, "192.168.5.2:80".parse().unwrap()), "127.0.0.1:80".parse().unwrap());
+        assert_eq!(map_dst(&aliases, "[fd00:5::2]:80".parse().unwrap()), "[::1]:80".parse().unwrap());
+        assert_eq!(map_dst(&aliases, "1.1.1.1:53".parse().unwrap()), "1.1.1.1:53".parse().unwrap());
+    }
+}

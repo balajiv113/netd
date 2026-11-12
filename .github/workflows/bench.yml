@@ -1,0 +1,103 @@
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      contenders:
+        description: "space separated (empty = all)"
+        required: false
+        default: ""
+      secs:
+        description: "iperf3 seconds per test"
+        required: false
+        default: "10"
+  push:
+    branches: [main]
+    paths: ["crates/**", "bench/**", ".github/workflows/bench.yml"]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo clippy --all-targets -- -D warnings && cargo test
+
+  linux-kvm:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          nproc; free -g; uname -r
+
+      - name: Install packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils iperf3 passt build-essential git >/dev/null
+          # passt sandboxes itself with user namespaces; Ubuntu restricts them via AppArmor by default.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          qemu-system-x86_64 --version | head -1
+
+      - name: Build passt (upstream, for vhost-user support)
+        run: |
+          if git clone --depth 1 https://passt.top/passt "$RUNNER_TEMP/passt" && make -C "$RUNNER_TEMP/passt" -j"$(nproc)" passt >/dev/null; then
+            echo "PASST=$RUNNER_TEMP/passt/passt" >> "$GITHUB_ENV"
+          else
+            # Copy outside /usr/bin so the distro AppArmor profile does not confine it.
+            cp /usr/bin/passt "$RUNNER_TEMP/passt-distro"
+            echo "PASST=$RUNNER_TEMP/passt-distro" >> "$GITHUB_ENV"
+          fi
+          echo "passt: $( ( $RUNNER_TEMP/passt/passt --version 2>/dev/null || /usr/bin/passt --version ) | head -1)"
+
+      - name: Fetch gvproxy
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/gvproxy" https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.0/gvproxy-linux-amd64
+          chmod +x "$RUNNER_TEMP/gvproxy"
+          echo "GVPROXY=$RUNNER_TEMP/gvproxy" >> "$GITHUB_ENV"
+
+      - name: Cache vhost-device-vsock
+        id: vdv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/vhost-device-vsock
+          key: vhost-device-vsock-0.3.0-${{ runner.os }}
+
+      - name: Install vhost-device-vsock
+        if: steps.vdv.outputs.cache-hit != 'true'
+        run: cargo install vhost-device-vsock --version 0.3.0 --locked
+
+      - name: Build netd
+        run: |
+          cargo build --release
+          echo "VHOST_DEVICE_VSOCK=$HOME/.cargo/bin/vhost-device-vsock" >> "$GITHUB_ENV"
+
+      - name: Cache cloud image
+        uses: actions/cache@v4
+        with:
+          path: bench/work/cloud.img
+          key: noble-cloudimg-v1
+
+      - name: Provision guest image
+        run: bench/provision.sh
+
+      - name: Run benchmark
+        run: python3 bench/run.py ${{ github.event.inputs.contenders }} --secs ${{ github.event.inputs.secs || '10' }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            bench/work/*.json
+            bench/work/*.md
+            bench/work/*.log
