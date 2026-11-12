@@ -19,6 +19,17 @@ cat >"$W/user-data" <<'EOF'
 #cloud-config
 package_update: true
 packages: [iperf3, qemu-guest-agent, iptables]
+write_files:
+  - path: /etc/netplan/60-bench.yaml
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        ethernets:
+          all:
+            match: {name: "en*"}
+            dhcp4: true
+            dhcp6: false
 bootcmd:
   - echo BOOTCMD_REACHED > /dev/ttyS0
 runcmd:
@@ -29,8 +40,6 @@ runcmd:
   - systemctl mask systemd-networkd-wait-online.service
   - systemctl disable unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer snapd.service snapd.socket || true
   - rm -f /etc/netplan/50-cloud-init.yaml
-  - printf 'network:\n  version: 2\n  ethernets:\n    all:\n      match: {name: "en*"}\n      dhcp4: true\n      dhcp6: false\n' > /etc/netplan/60-bench.yaml
-  - chmod 600 /etc/netplan/60-bench.yaml
   - touch /etc/cloud/cloud-init.disabled
   - sh -c 'modprobe dummy && echo MOD_DUMMY_OK; modinfo vmw_vsock_virtio_transport >/dev/null && echo MOD_VSOCK_OK' > /dev/ttyS0 2>&1
   - echo PROVISION_DONE > /dev/ttyS0
