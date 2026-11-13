@@ -42,7 +42,9 @@ first response or 256 KiB of outbound data; an explicit `--spin-us` sets
 both budgets. Set either option to zero to disable polling on that side.
 Both only poll while waiting for data: a side blocked by a full ring or
 socket is in a bulk transfer and sleeps until the peer has freed half the
-ring, rather than taking CPU from the peer that has to make room. Payload
+ring, rather than taking CPU from the peer that has to make room. The host
+also stops busy-polling after a full chunk of recent transfer activity; on
+the next activity after 1 ms idle, it becomes eligible to poll again. Payload
 is published in chunks of up to 256 KiB guest-to-host or 512 KiB
 host-to-guest, so both sides copy at the same time. The host can combine
 published guest-to-host chunks into a 512 KiB socket write.

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netd_common::proto::{self, Frame, FrameReader, Msg, PROTO_TCP, Request, STATUS_LEN, ShmRegion};
-use netd_common::shm::{Consumer, HOST_TO_GUEST_CHUNK, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
+use netd_common::shm::{CHUNK, Consumer, HOST_TO_GUEST_CHUNK, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringRwLock, VringState, VringT};
 use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
@@ -67,6 +67,8 @@ const YIELD_TOK: u64 = 0;
 /// Longest stretch the worker busy-polls before letting other users of the
 /// device lock (e.g. the vhost-user frontend thread) in.
 const MAX_POLL: Duration = Duration::from_millis(1);
+/// Return to latency-oriented polling after a bulk stream has been idle.
+const BULK_IDLE: Duration = Duration::from_millis(1);
 /// Host-side vsock ports for forwarded connections are allocated from here.
 const FIRST_HOST_PORT: u32 = 0x4000_0000;
 
@@ -256,8 +258,9 @@ struct Conn {
     guest_done: bool,
     frames: FrameReader,
     shm: Option<ShmConn>,
-    /// The last pump stopped at a full ring or socket (see pump_shm).
+    /// Full buffers or recent bulk activity make polling counterproductive.
     bulk: bool,
+    bulk_at: Option<Instant>,
 }
 
 impl Conn {
@@ -289,6 +292,7 @@ impl Conn {
             frames: FrameReader::default(),
             shm: None,
             bulk: false,
+            bulk_at: None,
         }
     }
 
@@ -303,6 +307,7 @@ impl Conn {
         self.wr_shut = false;
         self.guest_done = false;
         self.bulk = false;
+        self.bulk_at = None;
     }
 
     fn peer_credit(&self) -> usize {
@@ -319,6 +324,7 @@ impl Conn {
         let Some(s) = self.shm.as_mut() else { return Ok(false) };
         let fd = self.sock.as_ref().unwrap().as_raw_fd();
         let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+        let mut moved = 0usize;
         loop {
             while self.writable && !self.wr_shut {
                 let (k, n) = s.tx.data_iov(&mut iov, SHM_TX_BATCH)?;
@@ -343,6 +349,11 @@ impl Conn {
                 }
                 stats.shm_tx_bytes += w as u64;
                 stats.shm_tx_writes += 1;
+                moved += w as usize;
+                if moved >= CHUNK {
+                    self.bulk_at = Some(Instant::now());
+                    moved = 0;
+                }
                 if (w as usize) < n {
                     stats.shm_tx_sock_full += 1;
                     self.writable = false;
@@ -375,6 +386,11 @@ impl Conn {
                 }
                 stats.shm_rx_bytes += r as u64;
                 stats.shm_rx_reads += 1;
+                moved += r as usize;
+                if moved >= CHUNK {
+                    self.bulk_at = Some(Instant::now());
+                    moved = 0;
+                }
                 if (r as usize) < n {
                     self.readable = false;
                 }
@@ -382,11 +398,12 @@ impl Conn {
                     return Ok(true);
                 }
             }
-            // Blocked by a full ring or a full socket: a bulk transfer, where
-            // busy-polling would only take CPU from whoever has to make room.
+            // In sustained bulk traffic, polling takes CPU from the peer.
+            // Arm the rings even if the last chunk did not fill a buffer.
             let ring_full = self.readable && !self.sock_eof && !self.guest_shut_rcv;
             let sock_full = !self.writable && !self.wr_shut && s.tx.avail()? > 0;
-            self.bulk = ring_full || sock_full;
+            let streaming = self.bulk_at.is_some_and(|at| at.elapsed() < BULK_IDLE);
+            self.bulk = ring_full || sock_full || streaming;
             if !arm && !self.bulk {
                 return Ok(false);
             }
@@ -1720,5 +1737,20 @@ mod tests {
         assert_eq!(stats.shm_tx_bytes, SHM_TX_BATCH as u64);
         assert_eq!(stats.shm_tx_writes, 1);
         assert_eq!(c.shm.as_ref().unwrap().tx.avail().unwrap(), 0);
+        guest.free_iov(&mut iov, 1).unwrap();
+        unsafe { std::ptr::write_bytes(iov[0].iov_base, 1, 1) };
+        guest.commit(1);
+        c.bulk_at = Some(Instant::now() + Duration::from_secs(60));
+        c.pump_shm(&mut stats, false).unwrap();
+        assert!(c.bulk);
+        guest.free_iov(&mut iov, 1).unwrap();
+        unsafe { std::ptr::write_bytes(iov[0].iov_base, 1, 1) };
+        assert!(guest.commit(1));
+        c.bulk_at = Some(Instant::now() - 2 * BULK_IDLE);
+        c.pump_shm(&mut stats, false).unwrap();
+        assert!(!c.bulk);
+        guest.free_iov(&mut iov, 1).unwrap();
+        unsafe { std::ptr::write_bytes(iov[0].iov_base, 1, 1) };
+        assert!(!guest.commit(1));
     }
 }
