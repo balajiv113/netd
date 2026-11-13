@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use netd_common::proto::{self, Frame, FrameReader, ShmRegion};
 use netd_common::shm::{CHUNK, Consumer, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_CTL, SlotCtl};
 
-static SPIN_US: AtomicU64 = AtomicU64::new(200);
+static SPIN_US: AtomicU64 = AtomicU64::new(50);
+static STARTUP_SPIN_US: AtomicU64 = AtomicU64::new(200);
 
 /// Per-relay counters, logged when a relay ends if NETD_STATS is set.
 #[derive(Default, Debug)]
@@ -36,6 +37,7 @@ struct Counters {
 /// How long a relay busy-polls for new work before it sleeps (0 = never).
 pub fn set_spin_us(us: u64) {
     SPIN_US.store(us, Ordering::Relaxed);
+    STARTUP_SPIN_US.store(us, Ordering::Relaxed);
 }
 
 pub struct Region {
@@ -461,7 +463,14 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Optio
         // A full ring or application socket means bulk transfer: spinning
         // would take CPU from whoever has to make room.
         let bulk = ring_in || want_out;
-        if !bulk && spin(rx, ring_out, t, tev)? {
+        let spin_us = spin_budget(
+            SPIN_US.load(Ordering::Relaxed),
+            STARTUP_SPIN_US.load(Ordering::Relaxed),
+            id.is_some(),
+            cnt.bytes_in,
+            cnt.bytes_out,
+        );
+        if !bulk && spin(rx, ring_out, t, tev, spin_us)? {
             cnt.spin_hits += 1;
             continue;
         }
@@ -503,17 +512,22 @@ fn doorbell(v: RawFd) {
     unsafe { libc::sched_yield() };
 }
 
+fn spin_budget(steady: u64, startup: u64, outbound: bool, bytes_in: u64, bytes_out: u64) -> u64 {
+    if outbound && bytes_out == 0 && bytes_in < CHUNK as u64 { startup } else { steady }
+}
+
 /// Busy-polls the rings (and the application socket) for a short while.
 /// Request/response traffic usually gets its answer within microseconds;
 /// catching it here saves netd a doorbell and the guest an interrupt and a
 /// wakeup. Returns true if there is work.
-fn spin(rx: &Consumer, ring_out: bool, t: RawFd, tev: libc::c_short) -> io::Result<bool> {
-    let budget = Duration::from_micros(SPIN_US.load(Ordering::Relaxed));
+fn spin(rx: &Consumer, ring_out: bool, t: RawFd, tev: libc::c_short, spin_us: u64) -> io::Result<bool> {
+    let budget = Duration::from_micros(spin_us);
     let start = Instant::now();
     while start.elapsed() < budget {
         if ring_out && (rx.avail()? > 0 || rx.finished()?) {
             return Ok(true);
         }
+
         let mut pfd = libc::pollfd { fd: t, events: tev, revents: 0 };
         if tev != 0 && unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
             return Ok(true);
@@ -523,4 +537,18 @@ fn spin(rx: &Consumer, ring_out: bool, t: RawFd, tev: libc::c_short) -> io::Resu
         unsafe { libc::sched_yield() };
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_spin_ends_after_response_or_bulk_data() {
+        assert_eq!(spin_budget(50, 200, true, 5, 0), 200);
+        assert_eq!(spin_budget(50, 200, true, 5, 1), 50);
+        assert_eq!(spin_budget(50, 200, true, CHUNK as u64, 0), 50);
+        assert_eq!(spin_budget(50, 200, false, 0, 0), 50);
+        assert_eq!(spin_budget(0, 0, true, 0, 0), 0);
+    }
 }

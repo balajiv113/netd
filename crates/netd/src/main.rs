@@ -78,7 +78,7 @@ fn parse_args() -> Config {
         forwards: vec![],
         aliases: vec![],
         vsock_buf: 4 << 20,
-        busy_poll_us: 200,
+        busy_poll_us: 50,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
