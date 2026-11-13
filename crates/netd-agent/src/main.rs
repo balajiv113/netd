@@ -37,6 +37,8 @@ const USAGE: &str = "usage: netd-agent [options]
                          SO_ORIGINAL_DST (testing)
   --shm-slots N          shared-ring slots, i.e. concurrent connections using
                          shared memory (default 16, 0 = off)
+  --spin-us US           busy-poll the shared rings this long before sleeping
+                         (default 50, 0 = off)
   --vsock-buf BYTES      vsock credit window (default 4194304)
   --splice-to-vsock 0|1  splice guest TCP -> vsock (default 1; 0 = plain writes)";
 
@@ -109,6 +111,7 @@ fn parse_args() -> Config {
                 }
             }
             "--vsock-buf" => c.vsock_buf = parse(&v, "size"),
+            "--spin-us" => shm::set_spin_us(parse(&v, "microseconds")),
             "--splice-to-vsock" => SPLICE_TO_VSOCK.store(v == "1", Ordering::Relaxed),
             _ => die(&format!("unknown option {a}")),
         }

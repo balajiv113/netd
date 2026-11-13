@@ -10,10 +10,17 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use netd_common::proto::{self, ShmRegion};
 use netd_common::shm::{Consumer, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_CTL, SlotCtl};
+
+static SPIN_US: AtomicU64 = AtomicU64::new(50);
+
+/// How long a relay busy-polls for new work before it sleeps (0 = never).
+pub fn set_spin_us(us: u64) {
+    SPIN_US.store(us, Ordering::Relaxed);
+}
 
 pub struct Region {
     ctl: *mut u8,
@@ -337,19 +344,25 @@ pub fn relay(tcp: OwnedFd, vs: OwnedFd, slot: Slot) -> io::Result<()> {
             return Ok(());
         }
 
+        let tev = if want_in { libc::POLLIN } else { 0 } | if want_out { libc::POLLOUT } else { 0 };
+        let ring_in = !app_eof && !want_in;
+        let ring_out = !wr_shut && !want_out;
+        if spin(&tx, &rx, ring_in, ring_out, t, tev)? {
+            continue;
+        }
+
         // Nothing to do without blocking: ask netd for doorbells where a ring
         // is the obstacle, then sleep unless that raced with new work.
         let mut sleep = true;
-        if !app_eof && !want_in && !tx.wait()? {
+        if ring_in && !tx.wait()? {
             sleep = false;
         }
-        if !wr_shut && !want_out && !rx.wait()? {
+        if ring_out && !rx.wait()? {
             sleep = false;
         }
         if !sleep {
             continue;
         }
-        let tev = if want_in { libc::POLLIN } else { 0 } | if want_out { libc::POLLOUT } else { 0 };
         let mut pfd = [
             libc::pollfd { fd: if tev != 0 { t } else { -1 }, events: tev, revents: 0 },
             libc::pollfd { fd: v, events: libc::POLLIN, revents: 0 },
@@ -361,4 +374,24 @@ pub fn relay(tcp: OwnedFd, vs: OwnedFd, slot: Slot) -> io::Result<()> {
             return Err(io::ErrorKind::ConnectionReset.into());
         }
     }
+}
+
+/// Busy-polls the rings (and the application socket) for a short while.
+/// Request/response traffic usually gets its answer within microseconds;
+/// catching it here saves netd a doorbell and the guest an interrupt and a
+/// wakeup. Returns true if there is work.
+fn spin(tx: &Producer, rx: &Consumer, ring_in: bool, ring_out: bool, t: RawFd, tev: libc::c_short) -> io::Result<bool> {
+    let budget = Duration::from_micros(SPIN_US.load(Ordering::Relaxed));
+    let start = Instant::now();
+    while start.elapsed() < budget {
+        if ring_out && (rx.avail()? > 0 || rx.finished()?) || ring_in && tx.space()? > 0 {
+            return Ok(true);
+        }
+        let mut pfd = libc::pollfd { fd: t, events: tev, revents: 0 };
+        if tev != 0 && unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
+            return Ok(true);
+        }
+        std::hint::spin_loop();
+    }
+    Ok(false)
 }
