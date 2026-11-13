@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netd_common::proto::{self, Msg, PROTO_TCP, Request, STATUS_LEN, ShmRegion};
-use netd_common::shm::{Consumer, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
+use netd_common::shm::{CHUNK, Consumer, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringRwLock, VringState, VringT};
 use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
@@ -282,16 +282,16 @@ impl Conn {
 
     /// Moves payload between the host socket and the shared rings until
     /// both directions block. With `arm`, it then asks the agent for
-    /// doorbells where a ring is the obstacle. Returns true if the agent must
-    /// be woken.
+    /// doorbells where a ring is the obstacle. Returns true, possibly with
+    /// work left, as soon as the agent must be woken: the caller sends the
+    /// doorbell and pumps again, so both sides work on the ring at once.
     fn pump_shm(&mut self, stats: &mut Stats, arm: bool) -> io::Result<bool> {
         let Some(s) = self.shm.as_mut() else { return Ok(false) };
         let fd = self.sock.as_ref().unwrap().as_raw_fd();
         let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
-        let mut bell = false;
         loop {
             while self.writable && !self.wr_shut {
-                let (k, n) = s.tx.data_iov(&mut iov)?;
+                let (k, n) = s.tx.data_iov(&mut iov, CHUNK)?;
                 if n == 0 {
                     if s.tx.finished()? {
                         unsafe { libc::shutdown(fd, libc::SHUT_WR) };
@@ -313,14 +313,16 @@ impl Conn {
                 }
                 stats.shm_tx_bytes += w as u64;
                 stats.shm_tx_writes += 1;
-                bell |= s.tx.consume(w as usize);
                 if (w as usize) < n {
                     stats.shm_tx_sock_full += 1;
                     self.writable = false;
                 }
+                if s.tx.consume(w as usize) {
+                    return Ok(true);
+                }
             }
             while self.readable && !self.sock_eof && !self.guest_shut_rcv {
-                let (k, n) = s.rx.free_iov(&mut iov)?;
+                let (k, n) = s.rx.free_iov(&mut iov, CHUNK)?;
                 if n == 0 {
                     stats.shm_rx_ring_full += 1;
                     break;
@@ -336,18 +338,22 @@ impl Conn {
                 }
                 if r == 0 {
                     self.sock_eof = true;
-                    bell |= s.rx.close();
+                    if s.rx.close() {
+                        return Ok(true);
+                    }
                     break;
                 }
                 stats.shm_rx_bytes += r as u64;
                 stats.shm_rx_reads += 1;
-                bell |= s.rx.commit(r as usize);
                 if (r as usize) < n {
                     self.readable = false;
                 }
+                if s.rx.commit(r as usize) {
+                    return Ok(true);
+                }
             }
             if !arm {
-                return Ok(bell);
+                return Ok(false);
             }
             // Out of ring data (or space) with the socket still ready: ask the
             // agent for a doorbell, unless it raced us and there is work again.
@@ -359,7 +365,7 @@ impl Conn {
                 again = true;
             }
             if !again {
-                return Ok(bell);
+                return Ok(false);
             }
         }
     }
@@ -628,7 +634,10 @@ impl Dev {
             self.pump_shm(toks, !busy);
             self.process_rx(&vrings[RXQ], mem)?;
             if !busy {
-                break;
+                if self.shm_ready.is_empty() {
+                    break;
+                }
+                continue;
             }
             self.stats.busy_polls += 1;
             if self.stats.work() != before {
@@ -865,6 +874,9 @@ impl Dev {
                         c.prefix.push(0);
                         self.stats.bells_out += 1;
                         self.rx_ready.insert(tok);
+                    }
+                    if bell {
+                        self.shm_ready.insert(tok);
                     }
                     self.check_done(tok);
                 }

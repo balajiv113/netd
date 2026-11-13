@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netd_common::proto::{self, STATUS_LEN, ShmRegion};
-use netd_common::shm::{Consumer, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_CTL, SlotCtl};
+use netd_common::shm::{CHUNK, Consumer, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_CTL, SlotCtl};
 
 static SPIN_US: AtomicU64 = AtomicU64::new(50);
 
@@ -368,12 +368,10 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, st: &mut 
                 },
             }
         }
-        let mut bell = false;
-
         // application -> ring
         let mut want_in = false;
         while !app_eof {
-            let (k, n) = tx.free_iov(iov)?;
+            let (k, n) = tx.free_iov(iov, CHUNK)?;
             if n == 0 {
                 cnt.ring_full += 1;
                 break;
@@ -381,12 +379,16 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, st: &mut 
             match io_result(unsafe { libc::readv(t, iov.as_ptr(), k as i32) })? {
                 Io::Done(0) => {
                     app_eof = true;
-                    bell |= tx.close();
+                    if tx.close() {
+                        doorbell(v);
+                    }
                 }
                 Io::Done(r) => {
                     cnt.reads += 1;
                     cnt.bytes_in += r as u64;
-                    bell |= tx.commit(r);
+                    if tx.commit(r) {
+                        doorbell(v);
+                    }
                     if r < n {
                         cnt.app_empty += 1;
                         want_in = true;
@@ -404,7 +406,7 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, st: &mut 
         // ring -> application
         let mut want_out = false;
         while !wr_shut {
-            let (k, n) = rx.data_iov(iov)?;
+            let (k, n) = rx.data_iov(iov, CHUNK)?;
             if n == 0 {
                 if rx.finished()? {
                     unsafe { libc::shutdown(t, libc::SHUT_WR) };
@@ -416,7 +418,9 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, st: &mut 
                 Io::Done(w) => {
                     cnt.writes += 1;
                     cnt.bytes_out += w as u64;
-                    bell |= rx.consume(w);
+                    if rx.consume(w) {
+                        doorbell(v);
+                    }
                     if w < n {
                         cnt.app_full += 1;
                         want_out = true;
@@ -431,14 +435,6 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, st: &mut 
             }
         }
 
-        if bell {
-            // EAGAIN means netd has unread doorbells and will look anyway.
-            unsafe { libc::write(v, [0u8].as_ptr().cast(), 1) };
-            // Before Linux 6.11, virtio-vsock hands every packet to a kworker
-            // on this CPU, which would only get to run once this thread
-            // blocks, i.e. after it filled or drained the whole ring.
-            unsafe { libc::sched_yield() };
-        }
         if app_eof && wr_shut {
             // netd flushes whatever is left in the guest->host ring.
             return Ok(());
@@ -476,6 +472,17 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, st: &mut 
             return Err(io::ErrorKind::ConnectionReset.into());
         }
     }
+}
+
+/// Wakes netd as soon as it is waiting for this ring, so that it works on
+/// the ring while this side carries on with the next chunk.
+fn doorbell(v: RawFd) {
+    // EAGAIN means netd has unread doorbells and will look anyway.
+    unsafe { libc::write(v, [0u8].as_ptr().cast(), 1) };
+    // Before Linux 6.11, virtio-vsock hands every packet to a kworker on this
+    // CPU, which would only get to run once this thread blocks, i.e. after it
+    // filled or drained the whole ring.
+    unsafe { libc::sched_yield() };
 }
 
 /// Busy-polls the rings (and the application socket) for a short while.

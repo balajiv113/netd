@@ -25,6 +25,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 pub const HUGEPAGE: usize = 2 << 20;
 pub const RING_SIZE: usize = HUGEPAGE;
+/// Largest transfer either side makes between two ring updates. Committing in
+/// pieces lets the peer work on the ring concurrently instead of waiting for a
+/// whole ring's worth of data (or space) to turn over.
+pub const CHUNK: usize = RING_SIZE / 8;
 pub const SLOT_CTL: usize = 1024;
 pub const MAX_SLOTS: usize = HUGEPAGE / SLOT_CTL;
 pub const NO_SLOT: u16 = u16::MAX;
@@ -145,9 +149,9 @@ impl Producer {
         Ok(RING_SIZE - used as usize)
     }
 
-    /// Iovecs for the free space; returns (count, bytes).
-    pub fn free_iov(&self, out: &mut [libc::iovec; 2]) -> io::Result<(usize, usize)> {
-        let n = self.space()?;
+    /// Iovecs for at most `max` bytes of free space; returns (count, bytes).
+    pub fn free_iov(&self, out: &mut [libc::iovec; 2], max: usize) -> io::Result<(usize, usize)> {
+        let n = self.space()?.min(max);
         Ok((self.ring.iov(self.tail, n, out), n))
     }
 
@@ -201,9 +205,9 @@ impl Consumer {
         Ok(n as usize)
     }
 
-    /// Iovecs for the readable data; returns (count, bytes).
-    pub fn data_iov(&self, out: &mut [libc::iovec; 2]) -> io::Result<(usize, usize)> {
-        let n = self.avail()?;
+    /// Iovecs for at most `max` bytes of readable data; returns (count, bytes).
+    pub fn data_iov(&self, out: &mut [libc::iovec; 2], max: usize) -> io::Result<(usize, usize)> {
+        let n = self.avail()?.min(max);
         Ok((self.ring.iov(self.head, n, out), n))
     }
 
@@ -254,7 +258,7 @@ mod tests {
 
     fn write(p: &mut Producer, bytes: &[u8]) -> usize {
         let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
-        let (k, _) = p.free_iov(&mut iov).unwrap();
+        let (k, _) = p.free_iov(&mut iov, usize::MAX).unwrap();
         let mut done = 0;
         for v in &iov[..k] {
             let n = v.iov_len.min(bytes.len() - done);
@@ -267,7 +271,7 @@ mod tests {
 
     fn read(c: &mut Consumer, max: usize) -> Vec<u8> {
         let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
-        let (k, _) = c.data_iov(&mut iov).unwrap();
+        let (k, _) = c.data_iov(&mut iov, usize::MAX).unwrap();
         let mut out = Vec::new();
         for v in &iov[..k] {
             let n = v.iov_len.min(max - out.len());
