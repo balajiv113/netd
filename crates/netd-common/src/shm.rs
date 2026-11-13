@@ -29,7 +29,7 @@ pub const RING_SIZE: usize = HUGEPAGE;
 /// lets the peer work concurrently instead of waiting for a whole ring.
 pub const CHUNK: usize = RING_SIZE / 8;
 /// Larger batches amortize host socket reads during host-to-guest transfers.
-pub const HOST_TO_GUEST_CHUNK: usize = RING_SIZE / 4;
+pub const HOST_TO_GUEST_CHUNK: usize = RING_SIZE / 2;
 /// A waiting producer is only woken once this much space is free, so a full
 /// ring costs one doorbell per half turn rather than one per chunk, while the
 /// consumer keeps draining the other half.
