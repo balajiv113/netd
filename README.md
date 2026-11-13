@@ -35,8 +35,10 @@ Connections without a free slot fall back to payload over vsock.
 
 Doorbells cost a guest kernel round trip, a VM exit and an interrupt, so both
 sides poll briefly before arming them: netd's worker keeps servicing active
-rings for `--busy-poll-us` (default 50) after the last work, like vhost-net's
-busyloop, and the agent spins for `--spin-us` (default 50) before sleeping.
+rings for `--busy-poll-us` (default 200) after the last work, like vhost-net's
+busyloop, and the agent spins for `--spin-us` (default 200) before sleeping.
+These latency-oriented defaults use more CPU; set either to zero to disable
+polling on that side.
 Both only poll while waiting for data: a side blocked by a full ring or
 socket is in a bulk transfer and sleeps until the peer has freed half the
 ring, rather than taking CPU from the peer that has to make room. Payload
@@ -48,9 +50,7 @@ vsock stream, opened when the rings are registered, and the slot's
 connections run over it one after another: the agent sends `Open{id, dst}`,
 starts relaying at once without waiting for an answer, and finishes with
 `Close` or `Reset`. netd only replies with `Fail{id, errno}` if the connect
-fails, and the agent then resets the guest connection. Already available
-application data is published before `Open`; the agent never waits for data,
-so server-first protocols also work. A connection therefore
+fails, and the agent then resets the guest connection. A connection therefore
 costs no vsock stream setup or teardown, only a few frames. When no slot is
 free (or shm is off) the agent falls back to its `--pool N` (default 4) of
 per-connection vsock streams.
