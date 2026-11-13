@@ -10,7 +10,9 @@ identical QEMU settings except networking, then runs:
   rr            nbench 64-byte request/response latency (guest -> host)
   crr           nbench connections per second (guest -> host)
 
-"native" runs the same clients on the host against host loopback. Guest
+"native" runs the same clients on the host against host loopback;
+"native-cpu" does the same with clients and servers pinned to as many host
+CPUs as the guest has vCPUs (--vcpus), for a same-CPU-budget comparison. Guest
 control uses qemu-guest-agent over virtio-serial, so it works without any
 guest network.
 """
@@ -38,7 +40,9 @@ NBENCH_PORT = 7000
 TAP = "nbtap0"
 
 ARGS_VCPUS = 2
-ALL = ["native", "guest-lo", "tap-vhost", "slirp", "gvproxy", "passt", "passt-vu", "netd"]
+NATIVE_CPU_IPERF_PORT = 5202
+NATIVE_CPU_NBENCH_PORT = 7001
+ALL = ["native", "native-cpu", "guest-lo", "tap-vhost", "slirp", "gvproxy", "passt", "passt-vu", "netd"]
 NETD = ["netd"]
 BASELINE = Path(__file__).resolve().parent / "baseline" / "linux-kvm.json"
 
@@ -431,14 +435,28 @@ def guest_cpu_delta(a, b):
     return res
 
 
-def run_native(args):
-    res = {}
-    for t, extra in THROUGHPUT.items():
-        out = subprocess.run(iperf_args("127.0.0.1", 5201, extra, args.secs), capture_output=True, text=True).stdout
-        res[t] = iperf_gbps(out)
+def run_native(args, pin=None):
+    """Host loopback; with pin, servers and clients share the first pin CPUs."""
+    iperf_port, nb_port, pre, servers = 5201, NBENCH_PORT, [], []
+    if pin:
+        iperf_port, nb_port = NATIVE_CPU_IPERF_PORT, NATIVE_CPU_NBENCH_PORT
+        pre = ["taskset", "-c", f"0-{pin - 1}"]
+        servers = [subprocess.Popen(pre + ["iperf3", "-s", "-p", str(iperf_port)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+                   subprocess.Popen(pre + [BIN / "nbench", "server", f"127.0.0.1:{nb_port}"])]
         time.sleep(0.5)
-    res["rr"] = json.loads(subprocess.check_output([BIN / "nbench", "rr", f"127.0.0.1:{NBENCH_PORT}", "20000"]))
-    res["crr"] = json.loads(subprocess.check_output([BIN / "nbench", "crr", f"127.0.0.1:{NBENCH_PORT}", "5"]))
+    res = {"mtu": f"host loopback, {pin} CPU" if pin else "host loopback"}
+    try:
+        for t, extra in THROUGHPUT.items():
+            out = subprocess.run(pre + iperf_args("127.0.0.1", iperf_port, extra, args.secs),
+                                 capture_output=True, text=True).stdout
+            res[t] = iperf_gbps(out)
+            time.sleep(0.5)
+        res["rr"] = json.loads(subprocess.check_output(pre + [BIN / "nbench", "rr", f"127.0.0.1:{nb_port}", "20000"]))
+        res["crr"] = json.loads(subprocess.check_output(pre + [BIN / "nbench", "crr", f"127.0.0.1:{nb_port}", "5"]))
+    finally:
+        for p in servers:
+            p.terminate()
     return res
 
 
@@ -542,27 +560,29 @@ def run_contender(name, args):
     return res
 
 
-def fmt(v, native, unit=""):
+def fmt(v, native, pinned=None, unit=""):
+    """Value with its share of native (and of native-cpu, when it ran)."""
     if v is None:
         return "fail"
-    if native:
-        return f"{v}{unit} ({v / native * 100:.0f}%)"
-    return f"{v}{unit}"
+    pct = [f"{v / n * 100:.0f}%" for n in (native, pinned) if n]
+    return f"{v}{unit} ({' / '.join(pct)})" if pct else f"{v}{unit}"
 
 
 def report(results):
     nat = results.get("native", {})
+    pin = results.get("native-cpu", {})
     lines = [
+        ("Percentages: of native" + (" / of native-cpu" if pin else "") + "\n"),
         "| contender | up1 Gbps | down1 Gbps | up4 Gbps | down4 Gbps | fwd1 Gbps | rr p50 µs | crr conn/s | host helper CPU (up1) | guest busy cores up1 / down1 | link MTU |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name, r in results.items():
         cells = [name]
         for t in ("up1", "down1", "up4", "down4"):
-            cells.append(fmt(r.get(t), nat.get(t)))
-        cells.append(fmt(r.get("fwd1"), nat.get("up1")))
+            cells.append(fmt(r.get(t), nat.get(t), pin.get(t)))
+        cells.append(fmt(r.get("fwd1"), nat.get("up1"), pin.get("up1")))
         rr, crr = r.get("rr") or {}, r.get("crr") or {}
-        cells.append(str(rr.get("p50_us", "fail" if name != "native" or not rr else "")))
+        cells.append(str(rr.get("p50_us", "fail" if not name.startswith("native") or not rr else "")))
         cells.append(str(crr.get("conn_per_sec", "fail")))
         cpu = r.get("up1_cpu") or {}
         helpers = {k: v for k, v in cpu.items() if k != "qemu"}
@@ -575,7 +595,7 @@ def report(results):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("contenders", nargs="*", default=["native", *NETD],
+    ap.add_argument("contenders", nargs="*", default=["native", "native-cpu", *NETD],
                     help="default: native and netd, so percentages compare against the same runner; other contenders "
                          "come from the frozen baseline ('all' = rerun everything); "
                          "netd@AGENT_ARGS@NETD_ARGS (comma-separated) adds netd-agent / netd arguments; "
@@ -599,7 +619,12 @@ def main():
     try:
         for name in args.contenders:
             log(f"=== {name}")
-            results[name] = run_native(args) if name == "native" else run_contender(name, args)
+            if name == "native":
+                results[name] = run_native(args)
+            elif name == "native-cpu":
+                results[name] = run_native(args, pin=min(args.vcpus, os.cpu_count()))
+            else:
+                results[name] = run_contender(name, args)
             Path(args.out).write_text(json.dumps(results, indent=2))
     finally:
         server.terminate()

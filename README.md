@@ -73,6 +73,10 @@ Needs `qemu-system-x86`, `qemu-utils`, `cloud-image-utils`, `iperf3`, `passt`,
 `gvproxy` (`GVPROXY=`) and sudo
 for the privileged reference contenders.
 
+Percentages are given against `native` (host loopback, unrestricted) and
+`native-cpu` (host loopback pinned to as many CPUs as the guest has vCPUs),
+the fairer bound when the runner has few cores.
+
 ## Prototype limitations
 
 * TCP only (no UDP/ICMP/DNS yet); IPv4 destinations exercised by the benchmark.
