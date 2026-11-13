@@ -45,6 +45,8 @@ socket is in a bulk transfer and sleeps until the peer has freed half the
 ring, rather than taking CPU from the peer that has to make room. Payload
 moves in chunks of up to 256 KiB guest-to-host or 512 KiB host-to-guest,
 each published as soon as it is copied, so both sides copy at the same time.
+The host worker yields after moving one ring's worth per connection, so a
+busy stream cannot indefinitely delay other connections.
 
 Connection setup avoids round trips too. Each ring slot has one persistent
 vsock stream, opened when the rings are registered, and the slot's

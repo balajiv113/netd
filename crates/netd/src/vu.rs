@@ -221,6 +221,13 @@ struct ShmConn {
     rx: Producer,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShmPump {
+    Idle,
+    Bell,
+    Yield,
+}
+
 struct Conn {
     local_port: u32,
     peer_port: u32,
@@ -310,13 +317,13 @@ impl Conn {
 
     /// Moves payload between the host socket and the shared rings until
     /// both directions block. With `arm`, it then asks the agent for
-    /// doorbells where a ring is the obstacle. Returns true, possibly with
-    /// work left, as soon as the agent must be woken: the caller sends the
-    /// doorbell and pumps again, so both sides work on the ring at once.
-    fn pump_shm(&mut self, stats: &mut Stats, arm: bool) -> io::Result<bool> {
-        let Some(s) = self.shm.as_mut() else { return Ok(false) };
+    /// doorbells where a ring is the obstacle. Returns when the agent must
+    /// be woken or this connection has used its share of the worker.
+    fn pump_shm(&mut self, stats: &mut Stats, arm: bool) -> io::Result<ShmPump> {
+        let Some(s) = self.shm.as_mut() else { return Ok(ShmPump::Idle) };
         let fd = self.sock.as_ref().unwrap().as_raw_fd();
         let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+        let mut moved = 0usize;
         loop {
             while self.writable && !self.wr_shut {
                 let (k, n) = s.tx.data_iov(&mut iov, CHUNK)?;
@@ -341,12 +348,16 @@ impl Conn {
                 }
                 stats.shm_tx_bytes += w as u64;
                 stats.shm_tx_writes += 1;
+                moved += w as usize;
                 if (w as usize) < n {
                     stats.shm_tx_sock_full += 1;
                     self.writable = false;
                 }
                 if s.tx.consume(w as usize) {
-                    return Ok(true);
+                    return Ok(ShmPump::Bell);
+                }
+                if moved >= RING_SIZE {
+                    return Ok(ShmPump::Yield);
                 }
             }
             while self.readable && !self.sock_eof && !self.guest_shut_rcv {
@@ -367,17 +378,21 @@ impl Conn {
                 if r == 0 {
                     self.sock_eof = true;
                     if s.rx.close() {
-                        return Ok(true);
+                        return Ok(ShmPump::Bell);
                     }
                     break;
                 }
                 stats.shm_rx_bytes += r as u64;
                 stats.shm_rx_reads += 1;
+                moved += r as usize;
                 if (r as usize) < n {
                     self.readable = false;
                 }
                 if s.rx.commit(r as usize) {
-                    return Ok(true);
+                    return Ok(ShmPump::Bell);
+                }
+                if moved >= RING_SIZE {
+                    return Ok(ShmPump::Yield);
                 }
             }
             // Blocked by a full ring or a full socket: a bulk transfer, where
@@ -386,7 +401,7 @@ impl Conn {
             let sock_full = !self.writable && !self.wr_shut && s.tx.avail()? > 0;
             self.bulk = ring_full || sock_full;
             if !arm && !self.bulk {
-                return Ok(false);
+                return Ok(ShmPump::Idle);
             }
             // Out of ring data (or space) with the socket still ready: ask the
             // agent for a doorbell, unless it raced us and there is work again.
@@ -398,7 +413,7 @@ impl Conn {
                 again = true;
             }
             if !again {
-                return Ok(false);
+                return Ok(ShmPump::Idle);
             }
         }
     }
@@ -983,14 +998,14 @@ impl Dev {
                 continue;
             }
             match c.pump_shm(&mut self.stats, arm) {
-                Ok(bell) => {
+                Ok(result) => {
                     // One pending byte is enough to wake the agent.
-                    if bell && !c.guest_shut_rcv && c.prefix.is_empty() {
+                    if result == ShmPump::Bell && !c.guest_shut_rcv && c.prefix.is_empty() {
                         Frame::Bell.encode(&mut c.prefix);
                         self.stats.bells_out += 1;
                         self.rx_ready.insert(tok);
                     }
-                    if bell {
+                    if result != ShmPump::Idle {
                         self.shm_ready.insert(tok);
                     }
                     self.check_done(tok);
@@ -1691,4 +1706,30 @@ mod tests {
         assert_eq!(&b[..3], b"llo");
     }
 
+    #[test]
+    fn shared_ring_pump_yields_after_one_ring() {
+        let ctl: Box<SlotCtl> = Box::new(unsafe { std::mem::zeroed() });
+        ctl.claim();
+        let mut g2h_data = vec![0u8; RING_SIZE];
+        let mut h2g_data = vec![0u8; RING_SIZE];
+        let g2h = unsafe { Ring::new(&ctl.g2h, g2h_data.as_mut_ptr()) };
+        let h2g = unsafe { Ring::new(&ctl.h2g, h2g_data.as_mut_ptr()) };
+        let mut guest = Producer::new(g2h);
+        let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+        let (_, n) = guest.free_iov(&mut iov, RING_SIZE).unwrap();
+        assert_eq!(n, RING_SIZE);
+        unsafe { std::ptr::write_bytes(iov[0].iov_base, 7, n) };
+        guest.commit(n);
+
+        let raw = unsafe { libc::memfd_create(c"netd-pump-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let mut c = Conn::new(1, 2, State::Relay);
+        c.sock = Some(unsafe { OwnedFd::from_raw_fd(raw) });
+        c.shm = Some(ShmConn { slot: 0, ctl: &*ctl, tx: Consumer::new(g2h), rx: Producer::new(h2g) });
+        c.writable = true;
+        let mut stats = Stats::default();
+        assert_eq!(c.pump_shm(&mut stats, false).unwrap(), ShmPump::Yield);
+        assert_eq!(stats.shm_tx_bytes, RING_SIZE as u64);
+        assert_eq!(c.pump_shm(&mut stats, false).unwrap(), ShmPump::Idle);
+    }
 }
