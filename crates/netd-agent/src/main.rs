@@ -10,6 +10,7 @@
 //! With netd's vhost-user device, connections carry their payload through
 //! shared rings in guest hugepages (see `shm`) instead of the vsock stream.
 
+mod acceptor;
 mod pool;
 mod shm;
 
@@ -207,24 +208,17 @@ fn serve_inbound(conn: OwnedFd, region: &Option<Arc<shm::Region>>) -> io::Result
 }
 
 fn spawn_inbound(listener: OwnedFd, vsock_buf: Option<u64>, region: Option<Arc<shm::Region>>) {
-    thread::spawn(move || {
-        loop {
-            match sock::accept(listener.as_raw_fd()) {
-                Ok(c) => {
-                    if let Some(b) = vsock_buf {
-                        let _ = sock::set_vsock_buffer(c.as_raw_fd(), b);
-                    }
-                    let region = region.clone();
-                    thread::spawn(move || {
-                        if let Err(e) = serve_inbound(c, &region) {
-                            eprintln!("netd-agent: inbound: {e}");
-                        }
-                    });
-                }
-                Err(e) => eprintln!("netd-agent: inbound accept: {e}"),
+    acceptor::spawn(
+        move || sock::accept(listener.as_raw_fd()),
+        move |c| {
+            if let Some(b) = vsock_buf {
+                let _ = sock::set_vsock_buffer(c.as_raw_fd(), b);
             }
-        }
-    });
+            if let Err(e) = serve_inbound(c, &region) {
+                eprintln!("netd-agent: inbound: {e}");
+            }
+        },
+    );
 }
 
 fn main() {
@@ -265,26 +259,18 @@ fn main() {
     let (up, buf) = (cfg.upstream.clone(), cfg.vsock_buf);
     let pool = Pool::new(cfg.pool_size, Box::new(move || connect_upstream(&up, buf)));
     let cfg = Arc::new(cfg);
-    let mut handles = Vec::new();
     for (l, fixed_dst) in listeners {
         let (cfg, pool) = (cfg.clone(), pool.clone());
-        handles.push(thread::spawn(move || {
-            for c in l.incoming() {
-                match c {
-                    Ok(t) => {
-                        let (cfg, pool) = (cfg.clone(), pool.clone());
-                        thread::spawn(move || {
-                            if let Err(e) = serve_outbound(t, fixed_dst, &cfg, &pool) {
-                                eprintln!("netd-agent: outbound: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => eprintln!("netd-agent: accept: {e}"),
+        acceptor::spawn(
+            move || l.accept().map(|(t, _)| t),
+            move |t| {
+                if let Err(e) = serve_outbound(t, fixed_dst, &cfg, &pool) {
+                    eprintln!("netd-agent: outbound: {e}");
                 }
-            }
-        }));
+            },
+        );
     }
-    for h in handles {
-        let _ = h.join();
+    loop {
+        thread::park();
     }
 }
