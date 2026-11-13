@@ -457,7 +457,9 @@ fn spin(tx: &Producer, rx: &Consumer, ring_in: bool, ring_out: bool, t: RawFd, t
         if tev != 0 && unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
             return Ok(true);
         }
-        std::hint::spin_loop();
+        // Not a pause: whatever this thread just sent on vsock (request,
+        // status, doorbell) waits in a kworker on this CPU (see relay()).
+        unsafe { libc::sched_yield() };
     }
     Ok(false)
 }
