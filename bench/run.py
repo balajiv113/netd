@@ -19,6 +19,7 @@ import argparse
 import base64
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -160,8 +161,9 @@ class Contender:
     host_ip = ""          # address the guest uses to reach host loopback services
     mtu_note = ""
 
-    def __init__(self, procs):
+    def __init__(self, procs, variant=""):
         self.procs = procs  # list of Popen to stop afterwards
+        self.variant = variant
 
     def spawn(self, argv, name, env=None):
         f = open(W / f"{self.name}-{name}.log" if not name.startswith(self.name) else W / f"{name}.log", "w")
@@ -324,7 +326,7 @@ else
   ip addr add 192.168.5.15/32 dev lo; ip route add default dev lo src 192.168.5.15
 fi
 iptables -t nat -A OUTPUT -p tcp ! -d 127.0.0.0/8 -j REDIRECT --to-ports 15001
-nohup /usr/local/bin/netd-agent >/var/log/netd-agent.log 2>&1 &
+nohup /usr/local/bin/netd-agent {agent_args} >/var/log/netd-agent.log 2>&1 &
 sleep 0.5
 """
 
@@ -346,7 +348,7 @@ class Netd(Contender):
         return ["-chardev", f"socket,id=c1,path={W}/netd-vu.sock", "-device", "vhost-user-vsock-pci,chardev=c1"]
 
     def guest_setup(self, g):
-        g.run(NETD_GUEST_SETUP)
+        g.run(NETD_GUEST_SETUP.format(agent_args=shlex.join(self.variant.split(",")) if self.variant else ""))
 
     def setup_forward(self, g):
         return "127.0.0.1", FWD_HOST_PORT
@@ -410,7 +412,10 @@ def run_native(args):
 
 def run_contender(name, args):
     procs = []
-    c = CLASSES[name](procs)
+    # "netd@--spin-us,0" runs netd with extra (comma-separated) agent arguments.
+    base, _, variant = name.partition("@")
+    c = CLASSES[base](procs, variant)
+    c.name = name
     overlay = W / f"{name}.qcow2"
     overlay.unlink(missing_ok=True)
     sh(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", "base.qcow2", overlay])
@@ -537,7 +542,8 @@ def report(results):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("contenders", nargs="*", default=NETD,
-                    help="default: netd only; other contenders come from the frozen baseline ('all' = rerun everything)")
+                    help="default: netd only; other contenders come from the frozen baseline ('all' = rerun everything); "
+                         "netd@ARG,ARG... adds netd-agent arguments")
     ap.add_argument("--baseline", default=str(BASELINE), help="frozen results merged into the report ('' = none)")
     ap.add_argument("--secs", type=int, default=10)
     ap.add_argument("--vcpus", type=int, default=2)
