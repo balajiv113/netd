@@ -28,8 +28,7 @@ const USAGE: &str = "usage: netd-agent [options]
   --inbound-unix PATH    Unix socket for host port forwards (testing)
   --fixed-dst ADDR       destination to use when SO_ORIGINAL_DST is unavailable (testing)
   --vsock-buf BYTES      vsock credit window (default 4194304)
-  --splice-to-vsock 0|1  splice guest TCP -> vsock (default 0: multi-descriptor
-                         packets break some vhost-user-vsock backends)";
+  --splice-to-vsock 0|1  splice guest TCP -> vsock (default 1; 0 = plain writes)";
 
 #[derive(Clone)]
 enum Upstream {
@@ -46,7 +45,7 @@ struct Config {
     vsock_buf: u64,
 }
 
-static SPLICE_TO_VSOCK: AtomicBool = AtomicBool::new(false);
+static SPLICE_TO_VSOCK: AtomicBool = AtomicBool::new(true);
 
 fn die(m: &str) -> ! {
     eprintln!("netd-agent: {m}\n{USAGE}");

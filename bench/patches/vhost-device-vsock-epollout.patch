@@ -12,7 +12,7 @@ index 77e93c9..0432bc2 100644
      }
  }
 diff --git a/vhost-device-vsock/src/vhu_vsock_thread.rs b/vhost-device-vsock/src/vhu_vsock_thread.rs
-index 74b05e8..09af875 100644
+index 74b05e8..2e30b31 100644
 --- a/vhost-device-vsock/src/vhu_vsock_thread.rs
 +++ b/vhost-device-vsock/src/vhu_vsock_thread.rs
 @@ -444,7 +444,10 @@ impl VhostUserVsockThread {
@@ -38,6 +38,166 @@ index 74b05e8..09af875 100644
                  }
  
                  // Unregister stream from the epoll, register when connection is
+@@ -751,20 +756,36 @@ impl VhostUserVsockThread {
+             let mem = atomic_mem.clone().memory();
+ 
+             let head_idx = avail_desc.head_index();
+-            let pkt = match VsockPacket::from_tx_virtq_chain(
++            let chain = avail_desc.clone();
++            let sent = match VsockPacket::from_tx_virtq_chain(
+                 mem.deref(),
+                 &mut avail_desc,
+                 self.tx_buffer_size,
+             ) {
+-                Ok(pkt) => pkt,
+-                Err(e) => {
+-                    log::debug!("vsock: error reading TX packet: {e:?}");
+-                    continue;
+-                }
++                Ok(pkt) => self.active.then(|| self.thread_backend.send_pkt(&pkt)),
++                // Linux guests may spread the payload over several descriptors
++                // (non-linear skbs); virtio-vsock only accepts one, so gather it.
++                Err(e) => match gather_tx_chain(mem.deref(), chain, self.tx_buffer_size) {
++                    Some((mut hdr, mut data)) => {
++                        let raw = hdr.clone();
++                        let data = (!data.is_empty()).then_some(&mut data[..]);
++                        // SAFETY: `hdr` and `data` outlive `pkt`.
++                        let mut pkt = unsafe { VsockPacket::new(&mut hdr, data) }
++                            .expect("header buffer has PKT_HEADER_SIZE bytes");
++                        pkt.set_header_from_raw(&raw).expect("valid header size");
++                        self.active.then(|| self.thread_backend.send_pkt(&pkt))
++                    }
++                    None => {
++                        // Still return the chain to the guest; skipping it leaks
++                        // the descriptors and eventually starves the TX queue.
++                        warn!("vsock: dropping malformed TX packet: {e:?}");
++                        None
++                    }
++                },
+             };
+ 
+             if self.active {
+-                if self.thread_backend.send_pkt(&pkt).is_err() {
++                if matches!(sent, Some(Err(_))) {
+                     vring
+                         .get_mut()
+                         .get_queue_mut()
+@@ -884,6 +905,58 @@ impl Drop for VhostUserVsockThread {
+             .remove(&self.guest_cid);
+     }
+ }
++
++/// Copy a TX descriptor chain (header + payload, any number of descriptors)
++/// into owned buffers. Returns `None` for malformed chains.
++fn gather_tx_chain<M, T>(
++    mem: &M,
++    chain: virtio_queue::DescriptorChain<T>,
++    max_data_size: u32,
++) -> Option<(Vec<u8>, Vec<u8>)>
++where
++    M: vm_memory::GuestMemory,
++    T: Deref,
++    T::Target: vm_memory::GuestMemory,
++{
++    use vm_memory::{Address, Bytes};
++    let mut hdr = vec![0u8; PKT_HEADER_SIZE];
++    let mut hdr_len = 0usize;
++    let mut data = Vec::new();
++    let mut want = None;
++    for desc in chain {
++        if desc.is_write_only() {
++            return None;
++        }
++        let mut addr = desc.addr();
++        let mut left = desc.len() as usize;
++        if hdr_len < PKT_HEADER_SIZE {
++            let n = left.min(PKT_HEADER_SIZE - hdr_len);
++            mem.read_slice(&mut hdr[hdr_len..hdr_len + n], addr).ok()?;
++            hdr_len += n;
++            left -= n;
++            addr = addr.checked_add(n as u64)?;
++            if hdr_len == PKT_HEADER_SIZE {
++                // virtio_vsock_hdr.len is a le32 at offset 24.
++                let len = u32::from_le_bytes(hdr[24..28].try_into().unwrap());
++                if len > max_data_size {
++                    return None;
++                }
++                want = Some(len as usize);
++                data.reserve_exact(len as usize);
++            }
++        }
++        if let Some(w) = want {
++            let n = left.min(w - data.len());
++            if n > 0 {
++                let start = data.len();
++                data.resize(start + n, 0);
++                mem.read_slice(&mut data[start..], addr).ok()?;
++            }
++        }
++    }
++    (want == Some(data.len())).then_some((hdr, data))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::{
+@@ -978,6 +1051,56 @@ mod tests {
+         t.process_backend_evt(EventSet::empty());
+     }
+ 
++
++    #[test]
++    fn test_gather_tx_chain_multi_descriptor() {
++        use virtio_bindings::bindings::virtio_ring::VRING_DESC_F_NEXT;
++        use virtio_queue::{
++            desc::{split::Descriptor as SplitDescriptor, RawDescriptor},
++            mock::MockSplitQueue,
++            Queue,
++        };
++        use vm_memory::{Address, Bytes};
++
++        let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
++        let vq = MockSplitQueue::new(&mem, 16);
++        let payload: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
++        let mut hdr = [0u8; PKT_HEADER_SIZE];
++        hdr[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
++
++        // Header split over two descriptors, payload over three of uneven size.
++        let mut stream = hdr.to_vec();
++        stream.extend_from_slice(&payload);
++        let sizes = [30usize, 20, 100, 1, 193];
++        let mut addr = 0x4000u64;
++        let mut off = 0;
++        for (i, len) in sizes.iter().enumerate() {
++            let last = i == sizes.len() - 1;
++            let flags = if last { 0 } else { VRING_DESC_F_NEXT as u16 };
++            let d = RawDescriptor::from(SplitDescriptor::new(addr, *len as u32, flags, i as u16 + 1));
++            mem.write(&stream[off..off + len], GuestAddress(addr)).unwrap();
++            vq.desc_table().store(i as u16, d).unwrap();
++            addr += 0x100;
++            off += len;
++        }
++        mem.write_obj(0u16, vq.avail_addr().unchecked_add(4)).unwrap();
++        mem.write_obj(1u16, vq.avail_addr().unchecked_add(2)).unwrap();
++        let atomic = GuestMemoryAtomic::new(mem.clone());
++        let guard = atomic.memory();
++        let mut q = vq.create_queue::<Queue>().unwrap();
++        let mut chain = q.iter(guard.clone()).unwrap().next().unwrap();
++        let copy = chain.clone();
++
++        // The stock parser rejects this layout...
++        VsockPacket::from_tx_virtq_chain(guard.deref(), &mut chain, 1 << 20).unwrap_err();
++        // ...the gather path reassembles it exactly.
++        let (h, d) = gather_tx_chain(guard.deref(), copy.clone(), 1 << 20).unwrap();
++        assert_eq!(h, hdr);
++        assert_eq!(d, payload);
++        // Oversized payloads are refused.
++        assert!(gather_tx_chain(guard.deref(), copy, 100).is_none());
++    }
++
+     #[test]
+     fn test_vsock_thread_unix() {
+         let test_dir = tempdir().expect("Could not create a temp test directory.");
 diff --git a/vhost-device-vsock/src/vsock_conn.rs b/vhost-device-vsock/src/vsock_conn.rs
 index 6f095bc..9b0949f 100644
 --- a/vhost-device-vsock/src/vsock_conn.rs

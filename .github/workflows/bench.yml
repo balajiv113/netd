@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 90
     env:
       DEBIAN_FRONTEND: noninteractive
-      VDV_LOG: debug
+      VDV_LOG: warn
     steps:
       - uses: actions/checkout@v4
 
