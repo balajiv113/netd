@@ -318,7 +318,7 @@ impl Conn {
     /// Moves payload between the host socket and the shared rings until
     /// both directions block. With `arm`, it then asks the agent for
     /// doorbells where a ring is the obstacle. Returns when the agent must
-    /// be woken or this connection has used its share of the worker.
+    /// be woken or this connection has used its guest-to-host work budget.
     fn pump_shm(&mut self, stats: &mut Stats, arm: bool) -> io::Result<ShmPump> {
         let Some(s) = self.shm.as_mut() else { return Ok(ShmPump::Idle) };
         let fd = self.sock.as_ref().unwrap().as_raw_fd();
@@ -384,15 +384,11 @@ impl Conn {
                 }
                 stats.shm_rx_bytes += r as u64;
                 stats.shm_rx_reads += 1;
-                moved += r as usize;
                 if (r as usize) < n {
                     self.readable = false;
                 }
                 if s.rx.commit(r as usize) {
                     return Ok(ShmPump::Bell);
-                }
-                if moved >= RING_SIZE {
-                    return Ok(ShmPump::Yield);
                 }
             }
             // Blocked by a full ring or a full socket: a bulk transfer, where
