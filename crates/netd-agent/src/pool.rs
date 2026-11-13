@@ -4,9 +4,12 @@
 //! connections take an already-open stream from the pool instead, so a new
 //! guest connection only waits for netd's reply to its request. A background
 //! thread refills the pool.
+//!
+//! netd never sends on a stream before its request, so an idle stream that
+//! polls readable was reset (e.g. netd restarted) and is discarded.
 
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -23,13 +26,6 @@ pub struct Pool {
     connect: Connect,
 }
 
-/// Where a stream came from. A pooled stream may have been reset while idle
-/// (e.g. netd restarted), so callers retry those once on a fresh stream.
-pub enum Origin {
-    Pooled,
-    Fresh,
-}
-
 impl Pool {
     /// Keeps `size` streams open; `size == 0` connects on demand only.
     pub fn new(size: usize, connect: Connect) -> Arc<Self> {
@@ -41,15 +37,14 @@ impl Pool {
         p
     }
 
-    pub fn take(&self) -> io::Result<(OwnedFd, Origin)> {
-        if let Some(fd) = self.idle.lock().unwrap().pop() {
+    pub fn take(&self) -> io::Result<OwnedFd> {
+        loop {
+            let Some(fd) = self.idle.lock().unwrap().pop() else { break };
             self.low.notify_one();
-            return Ok((fd, Origin::Pooled));
+            if !stale(&fd) {
+                return Ok(fd);
+            }
         }
-        Ok(((self.connect)()?, Origin::Fresh))
-    }
-
-    pub fn fresh(&self) -> io::Result<OwnedFd> {
         (self.connect)()
     }
 
@@ -67,4 +62,9 @@ impl Pool {
             }
         }
     }
+}
+
+fn stale(fd: &OwnedFd) -> bool {
+    let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    unsafe { libc::poll(&mut p, 1, 0) != 0 }
 }

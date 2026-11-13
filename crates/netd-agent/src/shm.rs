@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use netd_common::proto::{self, ShmRegion};
+use netd_common::proto::{self, STATUS_LEN, ShmRegion};
 use netd_common::shm::{Consumer, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_CTL, SlotCtl};
 
 static SPIN_US: AtomicU64 = AtomicU64::new(50);
@@ -231,10 +231,14 @@ pub fn offer(region: &Option<Arc<Region>>) -> (Option<Slot>, u16) {
     (slot, idx)
 }
 
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
     unsafe {
         let fl = libc::fcntl(fd, libc::F_GETFL);
-        if fl < 0 || libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+        if fl < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fl = if on { fl | libc::O_NONBLOCK } else { fl & !libc::O_NONBLOCK };
+        if libc::fcntl(fd, libc::F_SETFL, fl) < 0 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -257,23 +261,81 @@ fn io_result(n: isize) -> io::Result<Io> {
     }
 }
 
+/// netd's answer to a request whose relay started before it arrived.
+struct Status {
+    want: Option<u16>,
+    buf: [u8; STATUS_LEN],
+    len: usize,
+}
+
+impl Status {
+    fn pending(&self) -> bool {
+        self.len < STATUS_LEN
+    }
+
+    fn unread(&mut self) -> &mut [u8] {
+        &mut self.buf[self.len..]
+    }
+
+    /// Records `n` bytes read into `unread()`; fails on a negative answer.
+    fn got(&mut self, n: usize) -> io::Result<()> {
+        self.len += n;
+        match self.want {
+            Some(want) if !self.pending() => match proto::parse_status(&self.buf) {
+                (0, slot) if slot == want => Ok(()),
+                (0, _) => Err(io::Error::other("netd did not attach the shared ring")),
+                (errno, _) => Err(io::Error::from_raw_os_error(errno)),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether netd took the slot, making it responsible for releasing it.
+    fn attached(&self) -> bool {
+        match self.want {
+            None => true,
+            Some(want) => !self.pending() && proto::parse_status(&self.buf) == (0, want),
+        }
+    }
+}
+
 /// Relays a guest TCP connection through a slot's rings. `vs` is the
 /// connection's vsock stream, used only for doorbells from here on.
-pub fn relay(tcp: OwnedFd, vs: OwnedFd, slot: Slot) -> io::Result<()> {
-    let (t, v) = (tcp.as_raw_fd(), vs.as_raw_fd());
-    set_nonblocking(t)?;
-    set_nonblocking(v)?;
+/// `status`: if netd has not answered the request yet, the slot its status
+/// (which then precedes the doorbells on `vs`) is expected to confirm.
+pub fn relay(tcp: OwnedFd, vs: OwnedFd, slot: Slot, status: Option<u16>) -> io::Result<()> {
+    let mut st = Status { want: status, buf: [0; STATUS_LEN], len: if status.is_some() { 0 } else { STATUS_LEN } };
+    let res = pump(tcp, vs.as_raw_fd(), &slot, &mut st);
+    if st.pending() {
+        // Find out who frees the slot; netd always answers or resets.
+        let mut f = File::from(vs);
+        if set_nonblocking(f.as_raw_fd(), false).is_ok() && f.read_exact(st.unread()).is_ok() {
+            st.len = STATUS_LEN;
+        }
+    }
+    if !st.attached() {
+        slot.give_back();
+    }
+    res
+}
+
+fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, st: &mut Status) -> io::Result<()> {
+    let t = tcp.as_raw_fd();
+    set_nonblocking(t, true)?;
+    set_nonblocking(v, true)?;
     let (mut tx, mut rx) = slot.rings();
     let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
     let mut app_eof = false;
     let mut wr_shut = false;
     let mut scratch = [0u8; 256];
     loop {
-        // Doorbells. netd keeps the stream open until the agent is done, so
-        // EOF or an error here means the connection was reset.
+        // Status, then doorbells. netd keeps the stream open until the agent
+        // is done, so EOF or an error here means the connection was reset.
         loop {
-            match unsafe { libc::read(v, scratch.as_mut_ptr().cast(), scratch.len()) } {
+            let buf = if st.pending() { st.unread() } else { &mut scratch[..] };
+            match unsafe { libc::read(v, buf.as_mut_ptr().cast(), buf.len()) } {
                 0 => return Err(io::ErrorKind::ConnectionReset.into()),
+                n if n > 0 && st.pending() => st.got(n as usize)?,
                 n if n > 0 => continue,
                 n => match io_result(n)? {
                     Io::Blocked => break,

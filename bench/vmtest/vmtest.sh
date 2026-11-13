@@ -37,8 +37,12 @@ for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do 
 ip link set lo up
 EXTRA=$(grep -o 'agent=[^ ]*' /proc/cmdline | cut -d= -f2- | tr , ' ')
 netd-agent --listen 127.0.0.1:15001 --fixed-dst 192.168.5.2:5201 \
-  --listen 127.0.0.1:15002 --fixed-dst 192.168.5.2:7000 $EXTRA 2>/tmp/agent.log &
+  --listen 127.0.0.1:15002 --fixed-dst 192.168.5.2:7000 \
+  --listen 127.0.0.1:15003 --fixed-dst 192.168.5.2:1 $EXTRA 2>/tmp/agent.log &
 sleep 1
+# Many more refused connections than ring slots: none may leak a slot, or
+# the tests below would not use the shared rings.
+echo "VMTEST: refused $(nbench crr 127.0.0.1:15003 1 2>&1)"
 echo "VMTEST: up";   iperf3 -c 127.0.0.1 -p 15001 -t 5 -O 1 --connect-timeout 5000 2>&1 | grep -E "receiver|error"
 echo "VMTEST: down"; iperf3 -c 127.0.0.1 -p 15001 -t 5 -O 1 -R --connect-timeout 5000 2>&1 | grep -E "receiver|error"
 echo "VMTEST: rr $(nbench rr 127.0.0.1:15002 2000 2>&1)"
@@ -47,7 +51,7 @@ iperf3 -s -1 -p 5301 >/dev/null 2>&1 & S=$!
 sleep 1
 echo "VMTEST: fwd-ready"
 timeout 60 sh -c "while kill -0 $S 2>/dev/null; do sleep 1; done"
-echo "VMTEST: agent log"; cat /tmp/agent.log
+echo "VMTEST: agent log"; sort /tmp/agent.log | uniq -c
 echo "VMTEST: DONE"; poweroff -f
 EOF
 chmod +x $R/init
@@ -73,12 +77,13 @@ if grep -q 'VMTEST: fwd-ready' $W/console.log; then
   timeout 30 iperf3 -c 127.0.0.1 -p 15301 -t 5 -O 1 --connect-timeout 5000 2>&1 | grep -E "receiver|error" > $W/fwd.txt || true
 fi
 wait $Q || true
-{ sed -n '/VMTEST: up/,/VMTEST: DONE/p' $W/console.log | grep -Ev '^\[ *[0-9]+\.[0-9]+\]' | grep -v fwd-ready
+{ sed -n '/VMTEST: refused/,/VMTEST: DONE/p' $W/console.log | grep -Ev '^\[ *[0-9]+\.[0-9]+\]' | grep -v fwd-ready
   echo "VMTEST: fwd (host -> guest)"; cat $W/fwd.txt 2>/dev/null; cat $W/fds.txt 2>/dev/null
-  grep -v '^netd: stats' $W/netd.log; grep -E 'shm_(tx|rx)_bytes: [1-9]' $W/netd.log | tail -2; } | tee $W/out.txt
+  grep -v '^netd: stats' $W/netd.log; { grep -E 'shm_(tx|rx)_bytes: [1-9]' $W/netd.log || true; } | tail -2; } | tee $W/out.txt
 echo "logs: $W"
 # Fail if any direction moved no data, or the shared rings were not used
 # (unless the agent was told not to use them).
 SHM_OK=1
 case "$EXTRA" in *shm-slots,0*) ;; *) grep -q 'shared rings registered' $W/out.txt && grep -qE 'shm_(tx|rx)_bytes: [1-9]' $W/out.txt || SHM_OK=0 ;; esac
+grep -q 'VMTEST: refused {"conns":0,"errors":[1-9][0-9]' $W/out.txt || SHM_OK=0
 [ $SHM_OK = 1 ] && grep -q "\"errors\":0" $W/out.txt && [ "$(grep -A1 -E 'VMTEST: (up|down|fwd)' $W/out.txt | grep -c ' [1-9][0-9.]* [MG]bits/sec')" -eq 3 ] && echo "VMTEST: PASS" || { echo "VMTEST: FAIL"; exit 1; }

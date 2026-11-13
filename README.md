@@ -38,6 +38,12 @@ sides poll briefly before arming them: netd's worker keeps servicing active
 rings for `--busy-poll-us` (default 50) after the last work, like vhost-net's
 busyloop, and the agent spins for `--spin-us` (default 50) before sleeping.
 
+Connection setup avoids round trips too: the agent keeps `--pool N`
+(default 4) vsock streams to netd open, and once it has offered a ring slot it
+starts relaying without waiting for netd's answer. The guest application is
+already connected to the agent anyway; if netd's status reports a failure, the
+agent resets the guest connection.
+
 ## Crates
 
 | crate | purpose |
