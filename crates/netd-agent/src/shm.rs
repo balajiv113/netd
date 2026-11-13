@@ -13,8 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use netd_common::proto::{self, Frame, ShmRegion};
-use crate::inbox::Inbox;
+use netd_common::proto::{self, Frame, FrameReader, ShmRegion};
 use netd_common::shm::{CHUNK, Consumer, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_CTL, SlotCtl};
 
 static SPIN_US: AtomicU64 = AtomicU64::new(50);
@@ -51,7 +50,7 @@ pub struct Region {
     /// its side.
     generation: AtomicU64,
     /// Each slot's stream to netd (see proto::Frame), for the current registration.
-    streams: Mutex<Vec<Arc<Mutex<Inbox>>>>,
+    streams: Mutex<Vec<Arc<OwnedFd>>>,
     next_id: AtomicU32,
 }
 
@@ -198,7 +197,7 @@ impl Region {
                 (e, _) => return Err(io::Error::from_raw_os_error(e)),
             }
             set_nonblocking(f.as_raw_fd(), true)?;
-            streams.push(Arc::new(Mutex::new(Inbox::new(f.into())?)));
+            streams.push(Arc::new(OwnedFd::from(f)));
         }
         // A new registration starts clean on netd's side: slots that only
         // netd still held (before it restarted) are free again.
@@ -238,7 +237,7 @@ pub struct Slot {
     region: Arc<Region>,
     idx: usize,
     generation: u64,
-    stream: Arc<Mutex<Inbox>>,
+    stream: Arc<OwnedFd>,
 }
 
 impl Slot {
@@ -327,12 +326,10 @@ fn send(v: RawFd, f: Frame) -> io::Result<()> {
 /// payload goes into the ring while netd connects, and a Fail frame resets
 /// the connection if netd could not.
 pub fn relay_out(tcp: OwnedFd, slot: Slot, dst: SocketAddr) -> io::Result<()> {
-    let stream = slot.stream.clone();
-    let mut inbox = stream.lock().unwrap();
-    let v = inbox.fd();
+    let v = slot.stream.as_raw_fd();
     let id = slot.region.next_id.fetch_add(1, Ordering::Relaxed);
     send(v, Frame::Open { id, dst })?;
-    let res = pump(tcp, &mut inbox, &slot, Some(id));
+    let res = pump(tcp, v, &slot, Some(id));
     // Fails only if the stream is gone, and netd with it.
     let _ = send(v, if res.is_ok() { Frame::Close } else { Frame::Reset });
     res
@@ -342,26 +339,27 @@ pub fn relay_out(tcp: OwnedFd, slot: Slot, dst: SocketAddr) -> io::Result<()> {
 /// own stream, used only for doorbells, and closing it ends the connection.
 pub fn relay_in(tcp: OwnedFd, vs: OwnedFd, slot: Slot) -> io::Result<()> {
     set_nonblocking(vs.as_raw_fd(), true)?;
-    pump(tcp, &mut Inbox::new(vs)?, &slot, None)
+    pump(tcp, vs.as_raw_fd(), &slot, None)
 }
 
 /// `id`: the connection on a slot stream, whose Fail frame ends the relay.
-fn pump(tcp: OwnedFd, inbox: &mut Inbox, slot: &Slot, id: Option<u32>) -> io::Result<()> {
+fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, id: Option<u32>) -> io::Result<()> {
     let t = tcp.as_raw_fd();
     set_nonblocking(t, true)?;
     let (mut tx, mut rx) = slot.rings();
     let mut cnt = Counters::default();
     let start = Instant::now();
-    let res = pump_loop(t, inbox, &mut tx, &mut rx, id, &mut cnt);
+    let res = pump_loop(t, v, &mut tx, &mut rx, id, &mut cnt);
     if std::env::var_os("NETD_STATS").is_some() && cnt.bytes_in + cnt.bytes_out > 1 << 20 {
         eprintln!("netd-agent: relay {:?} {cnt:?}", start.elapsed());
     }
     res
 }
 
-fn pump_loop(t: RawFd, inbox: &mut Inbox, tx: &mut Producer, rx: &mut Consumer, id: Option<u32>, cnt: &mut Counters) -> io::Result<()> {
+fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Option<u32>, cnt: &mut Counters) -> io::Result<()> {
     let iov = &mut [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
-    let v = inbox.fd();
+    let mut scratch = [0u8; 256];
+    let mut frames = FrameReader::default();
     let mut app_eof = false;
     let mut wr_shut = false;
     loop {
@@ -369,11 +367,17 @@ fn pump_loop(t: RawFd, inbox: &mut Inbox, tx: &mut Producer, rx: &mut Consumer, 
         // frames left over from the slot's earlier connections are ignored.
         // netd keeps the stream open while the agent uses it, so EOF here
         // means it went away.
-        inbox.read(|f| match f {
-            Frame::Fail { id: got, errno } if Some(got) == id => Err(io::Error::from_raw_os_error(errno)),
-            Frame::Bell | Frame::Fail { .. } => Ok(()),
-            _ => Err(io::Error::other("unexpected frame from netd")),
-        })?;
+        loop {
+            match io_result(unsafe { libc::read(v, scratch.as_mut_ptr().cast(), scratch.len()) })? {
+                Io::Done(0) => return Err(io::ErrorKind::ConnectionReset.into()),
+                Io::Done(n) => frames.feed(&scratch[..n], |f| match f {
+                    Frame::Fail { id: got, errno } if Some(got) == id => Err(io::Error::from_raw_os_error(errno)),
+                    Frame::Bell | Frame::Fail { .. } => Ok(()),
+                    _ => Err(io::Error::other("unexpected frame from netd")),
+                })?,
+                Io::Blocked => break,
+            }
+        }
         // application -> ring
         let mut want_in = false;
         let mut eof_bell = false;
@@ -477,7 +481,7 @@ fn pump_loop(t: RawFd, inbox: &mut Inbox, tx: &mut Producer, rx: &mut Consumer, 
         cnt.sleeps += 1;
         let mut pfd = [
             libc::pollfd { fd: if tev != 0 { t } else { -1 }, events: tev, revents: 0 },
-            libc::pollfd { fd: inbox.wait_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: v, events: libc::POLLIN, revents: 0 },
         ];
         if unsafe { libc::poll(pfd.as_mut_ptr(), 2, -1) } < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             return Err(io::Error::last_os_error());

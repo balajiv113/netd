@@ -434,8 +434,6 @@ struct Stats {
     rx_starved: u64,
     ctl_pkts: u64,
     credit_updates: u64,
-    /// Credit updates sent by the guest.
-    guest_credit_updates: u64,
     tx_irqs: u64,
     rx_irqs: u64,
     shm_tx_bytes: u64,
@@ -1209,7 +1207,7 @@ impl Dev {
                     self.reset(tok);
                 }
             }
-            OP_CREDIT_UPDATE => self.stats.guest_credit_updates += 1,
+            OP_CREDIT_UPDATE => {}
             OP_CREDIT_REQUEST => {
                 self.ctl.push_back(Ctl { local_port: key.0, peer_port: key.1, op: OP_CREDIT_UPDATE, flags: 0 })
             }
