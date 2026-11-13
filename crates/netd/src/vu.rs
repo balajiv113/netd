@@ -476,6 +476,7 @@ struct Dev {
     rx_ready: HashSet<u64>,
     tx_ready: HashSet<u64>,
     shm_ready: HashSet<u64>,
+    shm_toks: Vec<u64>,
     shm: Option<ShmTable>,
     busy_poll: Duration,
     yield_fd: OwnedFd,
@@ -639,6 +640,7 @@ impl Dev {
             rx_ready: HashSet::new(),
             tx_ready: HashSet::new(),
             shm_ready: HashSet::new(),
+            shm_toks: Vec::new(),
             shm: None,
             busy_poll: cfg.busy_poll,
             yield_fd,
@@ -654,6 +656,7 @@ impl Dev {
         self.stats.wakeups += 1;
         let start = Instant::now();
         let mut last_work = start;
+        let mut toks = std::mem::take(&mut self.shm_toks);
         loop {
             let before = self.stats.work();
             self.poll_epoll();
@@ -662,9 +665,14 @@ impl Dev {
             // While busy-polling, the rings are serviced without arming their
             // wait flags, so the agent has no reason to ring the doorbell.
             let busy = !self.busy_poll.is_zero() && self.conns.values().any(|c| c.shm.is_some() && !c.bulk);
-            let toks: Vec<u64> = if busy { self.shm_conns() } else { self.shm_ready.iter().copied().collect() };
-            self.shm_ready.clear();
-            self.pump_shm(toks, !busy);
+            toks.clear();
+            if busy {
+                self.shm_conns(&mut toks);
+                self.shm_ready.clear();
+            } else {
+                toks.extend(self.shm_ready.drain());
+            }
+            self.pump_shm(&toks, !busy);
             self.process_rx(&vrings[RXQ], mem)?;
             if !busy {
                 if self.shm_ready.is_empty() {
@@ -684,8 +692,9 @@ impl Dev {
             if last_work.elapsed() >= self.busy_poll {
                 // Idle: arm the rings and sleep, unless arming found work.
                 let before = self.stats.work();
-                let toks = self.shm_conns();
-                self.pump_shm(toks, true);
+                toks.clear();
+                self.shm_conns(&mut toks);
+                self.pump_shm(&toks, true);
                 self.process_rx(&vrings[RXQ], mem)?;
                 if self.stats.work() == before {
                     break;
@@ -694,12 +703,13 @@ impl Dev {
             }
             std::hint::spin_loop();
         }
+        self.shm_toks = toks;
         self.print_stats();
         Ok(())
     }
 
-    fn shm_conns(&self) -> Vec<u64> {
-        self.conns.iter().filter(|(_, c)| c.shm.is_some()).map(|(&t, _)| t).collect()
+    fn shm_conns(&self, toks: &mut Vec<u64>) {
+        toks.extend(self.conns.iter().filter(|(_, c)| c.shm.is_some()).map(|(&t, _)| t));
     }
 
     fn print_stats(&mut self) {
@@ -976,8 +986,8 @@ impl Dev {
         true
     }
 
-    fn pump_shm(&mut self, toks: Vec<u64>, arm: bool) {
-        for tok in toks {
+    fn pump_shm(&mut self, toks: &[u64], arm: bool) {
+        for &tok in toks {
             let Some(c) = self.conns.get_mut(&tok) else { continue };
             if c.state != State::Relay {
                 continue;
