@@ -17,6 +17,21 @@ use netd_common::shm::{Consumer, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_CTL, Sl
 
 static SPIN_US: AtomicU64 = AtomicU64::new(50);
 
+/// Per-relay counters, logged when a relay ends if NETD_STATS is set.
+#[derive(Default, Debug)]
+struct Counters {
+    reads: u64,
+    bytes_in: u64,
+    /// readv found the ring full / the application socket empty.
+    ring_full: u64,
+    app_empty: u64,
+    writes: u64,
+    bytes_out: u64,
+    app_full: u64,
+    spin_hits: u64,
+    sleeps: u64,
+}
+
 /// How long a relay busy-polls for new work before it sleeps (0 = never).
 pub fn set_spin_us(us: u64) {
     SPIN_US.store(us, Ordering::Relaxed);
@@ -324,10 +339,20 @@ fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, st: &mut Status) -> io::Result<()> 
     set_nonblocking(t, true)?;
     set_nonblocking(v, true)?;
     let (mut tx, mut rx) = slot.rings();
-    let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+    let mut cnt = Counters::default();
+    let start = Instant::now();
+    let res = pump_loop(t, v, &mut tx, &mut rx, st, &mut cnt);
+    if std::env::var_os("NETD_STATS").is_some() && cnt.bytes_in + cnt.bytes_out > 1 << 20 {
+        eprintln!("netd-agent: relay {:?} {cnt:?}", start.elapsed());
+    }
+    res
+}
+
+fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, st: &mut Status, cnt: &mut Counters) -> io::Result<()> {
+    let iov = &mut [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+    let mut scratch = [0u8; 256];
     let mut app_eof = false;
     let mut wr_shut = false;
-    let mut scratch = [0u8; 256];
     loop {
         // Status, then doorbells. netd keeps the stream open until the agent
         // is done, so EOF or an error here means the connection was reset.
@@ -348,8 +373,9 @@ fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, st: &mut Status) -> io::Result<()> 
         // application -> ring
         let mut want_in = false;
         while !app_eof {
-            let (k, n) = tx.free_iov(&mut iov)?;
+            let (k, n) = tx.free_iov(iov)?;
             if n == 0 {
+                cnt.ring_full += 1;
                 break;
             }
             match io_result(unsafe { libc::readv(t, iov.as_ptr(), k as i32) })? {
@@ -358,13 +384,17 @@ fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, st: &mut Status) -> io::Result<()> 
                     bell |= tx.close();
                 }
                 Io::Done(r) => {
+                    cnt.reads += 1;
+                    cnt.bytes_in += r as u64;
                     bell |= tx.commit(r);
                     if r < n {
+                        cnt.app_empty += 1;
                         want_in = true;
                         break;
                     }
                 }
                 Io::Blocked => {
+                    cnt.app_empty += 1;
                     want_in = true;
                     break;
                 }
@@ -374,7 +404,7 @@ fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, st: &mut Status) -> io::Result<()> 
         // ring -> application
         let mut want_out = false;
         while !wr_shut {
-            let (k, n) = rx.data_iov(&mut iov)?;
+            let (k, n) = rx.data_iov(iov)?;
             if n == 0 {
                 if rx.finished()? {
                     unsafe { libc::shutdown(t, libc::SHUT_WR) };
@@ -384,13 +414,17 @@ fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, st: &mut Status) -> io::Result<()> 
             }
             match io_result(unsafe { libc::writev(t, iov.as_ptr(), k as i32) })? {
                 Io::Done(w) => {
+                    cnt.writes += 1;
+                    cnt.bytes_out += w as u64;
                     bell |= rx.consume(w);
                     if w < n {
+                        cnt.app_full += 1;
                         want_out = true;
                         break;
                     }
                 }
                 Io::Blocked => {
+                    cnt.app_full += 1;
                     want_out = true;
                     break;
                 }
@@ -413,7 +447,8 @@ fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, st: &mut Status) -> io::Result<()> 
         let tev = if want_in { libc::POLLIN } else { 0 } | if want_out { libc::POLLOUT } else { 0 };
         let ring_in = !app_eof && !want_in;
         let ring_out = !wr_shut && !want_out;
-        if spin(&tx, &rx, ring_in, ring_out, t, tev)? {
+        if spin(tx, rx, ring_in, ring_out, t, tev)? {
+            cnt.spin_hits += 1;
             continue;
         }
 
@@ -429,6 +464,7 @@ fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, st: &mut Status) -> io::Result<()> 
         if !sleep {
             continue;
         }
+        cnt.sleeps += 1;
         let mut pfd = [
             libc::pollfd { fd: if tev != 0 { t } else { -1 }, events: tev, revents: 0 },
             libc::pollfd { fd: v, events: libc::POLLIN, revents: 0 },

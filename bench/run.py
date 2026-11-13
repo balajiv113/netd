@@ -333,7 +333,7 @@ else
   ip addr add 192.168.5.15/32 dev lo; ip route add default dev lo src 192.168.5.15
 fi
 iptables -t nat -A OUTPUT -p tcp ! -d 127.0.0.0/8 -j REDIRECT --to-ports 15001
-nohup /usr/local/bin/netd-agent {agent_args} >/var/log/netd-agent.log 2>&1 &
+NETD_STATS=1 nohup /usr/local/bin/netd-agent {agent_args} >/var/log/netd-agent.log 2>&1 &
 sleep 0.5
 """
 

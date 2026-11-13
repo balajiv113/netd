@@ -303,20 +303,26 @@ impl Conn {
                 if w < 0 {
                     match errno() {
                         libc::EINTR => continue,
-                        libc::EAGAIN => self.writable = false,
+                        libc::EAGAIN => {
+                            stats.shm_tx_sock_full += 1;
+                            self.writable = false;
+                        }
                         e => return Err(io::Error::from_raw_os_error(e)),
                     }
                     break;
                 }
                 stats.shm_tx_bytes += w as u64;
+                stats.shm_tx_writes += 1;
                 bell |= s.tx.consume(w as usize);
                 if (w as usize) < n {
+                    stats.shm_tx_sock_full += 1;
                     self.writable = false;
                 }
             }
             while self.readable && !self.sock_eof && !self.guest_shut_rcv {
                 let (k, n) = s.rx.free_iov(&mut iov)?;
                 if n == 0 {
+                    stats.shm_rx_ring_full += 1;
                     break;
                 }
                 let r = unsafe { libc::readv(fd, iov.as_ptr(), k as i32) };
@@ -334,6 +340,7 @@ impl Conn {
                     break;
                 }
                 stats.shm_rx_bytes += r as u64;
+                stats.shm_rx_reads += 1;
                 bell |= s.rx.commit(r as usize);
                 if (r as usize) < n {
                     self.readable = false;
@@ -392,6 +399,12 @@ struct Stats {
     rx_irqs: u64,
     shm_tx_bytes: u64,
     shm_rx_bytes: u64,
+    /// writev calls to host sockets, and how often one ended short or EAGAIN.
+    shm_tx_writes: u64,
+    shm_tx_sock_full: u64,
+    /// readv calls from host sockets, and how often the ring had no room.
+    shm_rx_reads: u64,
+    shm_rx_ring_full: u64,
     bells_in: u64,
     bells_out: u64,
     epoll_events: u64,
