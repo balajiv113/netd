@@ -245,6 +245,8 @@ struct Conn {
     /// Slot the agent asked for in its request.
     want_slot: u16,
     shm: Option<ShmConn>,
+    /// The last pump stopped at a full ring or socket (see pump_shm).
+    bulk: bool,
 }
 
 impl Conn {
@@ -272,6 +274,7 @@ impl Conn {
             guest_shut_rcv: false,
             want_slot: NO_SLOT,
             shm: None,
+            bulk: false,
         }
     }
 
@@ -352,7 +355,12 @@ impl Conn {
                     return Ok(true);
                 }
             }
-            if !arm {
+            // Blocked by a full ring or a full socket: a bulk transfer, where
+            // busy-polling would only take CPU from whoever has to make room.
+            let ring_full = self.readable && !self.sock_eof && !self.guest_shut_rcv;
+            let sock_full = !self.writable && !self.wr_shut && s.tx.avail()? > 0;
+            self.bulk = ring_full || sock_full;
+            if !arm && !self.bulk {
                 return Ok(false);
             }
             // Out of ring data (or space) with the socket still ready: ask the
@@ -628,7 +636,7 @@ impl Dev {
             self.flush_tx_ready();
             // While busy-polling, the rings are serviced without arming their
             // wait flags, so the agent has no reason to ring the doorbell.
-            let busy = !self.busy_poll.is_zero() && self.conns.values().any(|c| c.shm.is_some());
+            let busy = !self.busy_poll.is_zero() && self.conns.values().any(|c| c.shm.is_some() && !c.bulk);
             let toks: Vec<u64> = if busy { self.shm_conns() } else { self.shm_ready.iter().copied().collect() };
             self.shm_ready.clear();
             self.pump_shm(toks, !busy);

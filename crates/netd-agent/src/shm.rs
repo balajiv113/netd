@@ -443,7 +443,11 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, st: &mut 
         let tev = if want_in { libc::POLLIN } else { 0 } | if want_out { libc::POLLOUT } else { 0 };
         let ring_in = !app_eof && !want_in;
         let ring_out = !wr_shut && !want_out;
-        if spin(tx, rx, ring_in, ring_out, t, tev)? {
+        // Spinning only pays off while waiting for data (request/response).
+        // A full ring or application socket means bulk transfer: spinning
+        // would take CPU from whoever has to make room.
+        let bulk = ring_in || want_out;
+        if !bulk && spin(rx, ring_out, t, tev)? {
             cnt.spin_hits += 1;
             continue;
         }
@@ -489,11 +493,11 @@ fn doorbell(v: RawFd) {
 /// Request/response traffic usually gets its answer within microseconds;
 /// catching it here saves netd a doorbell and the guest an interrupt and a
 /// wakeup. Returns true if there is work.
-fn spin(tx: &Producer, rx: &Consumer, ring_in: bool, ring_out: bool, t: RawFd, tev: libc::c_short) -> io::Result<bool> {
+fn spin(rx: &Consumer, ring_out: bool, t: RawFd, tev: libc::c_short) -> io::Result<bool> {
     let budget = Duration::from_micros(SPIN_US.load(Ordering::Relaxed));
     let start = Instant::now();
     while start.elapsed() < budget {
-        if ring_out && (rx.avail()? > 0 || rx.finished()?) || ring_in && tx.space()? > 0 {
+        if ring_out && (rx.avail()? > 0 || rx.finished()?) {
             return Ok(true);
         }
         let mut pfd = libc::pollfd { fd: t, events: tev, revents: 0 };

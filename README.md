@@ -37,6 +37,11 @@ Doorbells cost a guest kernel round trip, a VM exit and an interrupt, so both
 sides poll briefly before arming them: netd's worker keeps servicing active
 rings for `--busy-poll-us` (default 50) after the last work, like vhost-net's
 busyloop, and the agent spins for `--spin-us` (default 50) before sleeping.
+Both only poll while waiting for data: a side blocked by a full ring or
+socket is in a bulk transfer and sleeps until the peer has freed half the
+ring, rather than taking CPU from the peer that has to make room. Payload
+moves in 256 KiB chunks, each published as soon as it is copied, so both
+sides copy at the same time.
 
 Connection setup avoids round trips too: the agent keeps `--pool N`
 (default 4) vsock streams to netd open, and once it has offered a ring slot it
