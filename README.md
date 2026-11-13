@@ -43,7 +43,7 @@ both budgets. Set either option to zero to disable polling on that side.
 Both only poll while waiting for data: a side blocked by a full ring or
 socket is in a bulk transfer and sleeps until the peer has freed half the
 ring, rather than taking CPU from the peer that has to make room. Payload
-moves in 256 KiB chunks, each published as soon as it is copied, so both
+moves in 512 KiB chunks, each published as soon as it is copied, so both
 sides copy at the same time.
 
 Connection setup avoids round trips too. Each ring slot has one persistent

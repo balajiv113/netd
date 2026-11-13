@@ -18,6 +18,7 @@ use netd_common::shm::{CHUNK, Consumer, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_
 
 static SPIN_US: AtomicU64 = AtomicU64::new(50);
 static STARTUP_SPIN_US: AtomicU64 = AtomicU64::new(200);
+const STARTUP_LIMIT: u64 = 256 * 1024;
 
 /// Per-relay counters, logged when a relay ends if NETD_STATS is set.
 #[derive(Default, Debug)]
@@ -513,7 +514,7 @@ fn doorbell(v: RawFd) {
 }
 
 fn spin_budget(steady: u64, startup: u64, outbound: bool, bytes_in: u64, bytes_out: u64) -> u64 {
-    if outbound && bytes_out == 0 && bytes_in < CHUNK as u64 { startup } else { steady }
+    if outbound && bytes_out == 0 && bytes_in < STARTUP_LIMIT { startup } else { steady }
 }
 
 /// Busy-polls the rings (and the application socket) for a short while.
@@ -547,7 +548,7 @@ mod tests {
     fn startup_spin_ends_after_response_or_bulk_data() {
         assert_eq!(spin_budget(50, 200, true, 5, 0), 200);
         assert_eq!(spin_budget(50, 200, true, 5, 1), 50);
-        assert_eq!(spin_budget(50, 200, true, CHUNK as u64, 0), 50);
+        assert_eq!(spin_budget(50, 200, true, STARTUP_LIMIT, 0), 50);
         assert_eq!(spin_budget(50, 200, false, 0, 0), 50);
         assert_eq!(spin_budget(0, 0, true, 0, 0), 0);
     }
