@@ -36,8 +36,8 @@ NBENCH_PORT = 7000
 TAP = "nbtap0"
 
 ARGS_VCPUS = 2
-ALL = ["native", "tap-vhost", "slirp", "gvproxy", "passt", "passt-vu", "netd", "netd-vu", "netd-kvsock"]
-NETD = ["netd", "netd-vu", "netd-kvsock"]
+ALL = ["native", "tap-vhost", "slirp", "gvproxy", "passt", "passt-vu", "netd"]
+NETD = ["netd"]
 BASELINE = Path(__file__).resolve().parent / "baseline" / "linux-kvm.json"
 
 
@@ -329,50 +329,11 @@ sleep 0.5
 """
 
 
-class NetdVU(Contender):
-    name = "netd-vu"
+class Netd(Contender):
+    """netd is the vhost-user-vsock device; the guest runs netd-agent."""
+    name = "netd"
     host_ip = "192.168.5.2"
     mtu_note = "n/a (socket offload, vhost-user-vsock, unprivileged)"
-
-    def start_backend(self):
-        for s in ("vu-vsock.sock", "vm.vsock", "vm.vsock_1024"):
-            (W / s).unlink(missing_ok=True)
-        self.spawn([os.environ.get("VHOST_DEVICE_VSOCK", "vhost-device-vsock"), "--vm",
-                    f"guest-cid=3,socket={W}/vu-vsock.sock,uds-path={W}/vm.vsock,tx-buffer-size=1048576,queue-size=1024"],
-                   "vhost-device-vsock", env={"RUST_LOG": os.environ.get("VDV_LOG", "warn")})
-        self.spawn([BIN / "netd", "--listen-uds", f"{W}/vm.vsock_1024", "--guest-uds", f"{W}/vm.vsock",
-                    "--forward", f"127.0.0.1:{FWD_HOST_PORT}={GUEST_IPERF_PORT}"], "netd")
-        wait_path(W / "vu-vsock.sock")
-        wait_path(W / "vm.vsock_1024")
-
-    def qemu_net(self):
-        return ["-chardev", f"socket,id=c1,path={W}/vu-vsock.sock", "-device", "vhost-user-vsock-pci,chardev=c1"]
-
-    def guest_setup(self, g):
-        g.run(NETD_GUEST_SETUP)
-
-    def setup_forward(self, g):
-        return "127.0.0.1", FWD_HOST_PORT
-
-
-class NetdKvsock(NetdVU):
-    name = "netd-kvsock"
-    mtu_note = "n/a (socket offload, kernel vhost-vsock, needs /dev/vhost-vsock access)"
-
-    def start_backend(self):
-        sh("sudo modprobe vhost_vsock && sudo chmod 666 /dev/vhost-vsock")
-        self.spawn([BIN / "netd", "--listen-vsock", "1024", "--guest-vsock", "3",
-                    "--forward", f"127.0.0.1:{FWD_HOST_PORT}={GUEST_IPERF_PORT}"], "netd")
-        time.sleep(0.3)
-
-    def qemu_net(self):
-        return ["-device", "vhost-vsock-pci,guest-cid=3"]
-
-
-class NetdEmbedded(NetdVU):
-    """netd is the vhost-user-vsock device itself (no vhost-device-vsock)."""
-    name = "netd"
-    mtu_note = "n/a (socket offload, netd embedded vhost-user-vsock, unprivileged)"
 
     def start_backend(self):
         (W / "netd-vu.sock").unlink(missing_ok=True)
@@ -384,8 +345,14 @@ class NetdEmbedded(NetdVU):
     def qemu_net(self):
         return ["-chardev", f"socket,id=c1,path={W}/netd-vu.sock", "-device", "vhost-user-vsock-pci,chardev=c1"]
 
+    def guest_setup(self, g):
+        g.run(NETD_GUEST_SETUP)
 
-CLASSES = {c.name: c for c in [TapVhost, Slirp, Gvproxy, Passt, PasstVU, NetdEmbedded, NetdVU, NetdKvsock]}
+    def setup_forward(self, g):
+        return "127.0.0.1", FWD_HOST_PORT
+
+
+CLASSES = {c.name: c for c in [TapVhost, Slirp, Gvproxy, Passt, PasstVU, Netd]}
 
 
 def iperf_gbps(js):

@@ -1,13 +1,12 @@
 #!/bin/bash
 # Local pre-CI check: boots the Ubuntu 6.8 guest kernel under QEMU (TCG works, no KVM needed)
-# with netd-agent in an initramfs, and runs up/down iperf3 + rr through
-# vhost-device-vsock + netd.
-#   bench/vmtest/vmtest.sh [embedded|VHOST_DEVICE_VSOCK_BIN] [agent-args,comma,separated]
-# "embedded" (default) runs netd itself as the vhost-user-vsock device.
+# with netd-agent in an initramfs, and runs up/down/fwd iperf3 + rr/crr through netd
+# (netd is the vhost-user-vsock device).
+#   bench/vmtest/vmtest.sh [agent-args,comma,separated]
 # Needs: qemu-system-x86_64, iperf3, cpio, zstd, curl, dpkg-deb.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-VDV=${1:-embedded}; EXTRA=${2:-}
+EXTRA=${1:-}
 KVER=${KVER:-6.8.0-147}
 C=${VMTEST_CACHE:-$HOME/.cache/netd-vmtest}; W=$(mktemp -d)
 mkdir -p "$C"
@@ -60,12 +59,7 @@ cleanup() { kill "${PIDS[@]}" 2>/dev/null || true; }
 trap cleanup EXIT
 iperf3 -s -p 5201 >$W/iperf.log 2>&1 & PIDS+=($!)
 $N/nbench server 127.0.0.1:7000 >$W/nb.log 2>&1 & PIDS+=($!)
-if [ "$VDV" = embedded ]; then
-  $N/netd --vhost-user $W/vu.sock --guest-cid 3 --forward 127.0.0.1:15301=5301 >$W/netd.log 2>&1 & PIDS+=($!)
-else
-  RUST_LOG=${VDV_LOG:-warn} "$VDV" --vm guest-cid=3,socket=$W/vu.sock,uds-path=$W/vm.vsock,tx-buffer-size=1048576,queue-size=1024 >$W/vdv.log 2>&1 & PIDS+=($!)
-  $N/netd --listen-uds $W/vm.vsock_1024 --guest-uds $W/vm.vsock --forward 127.0.0.1:15301=5301 >$W/netd.log 2>&1 & PIDS+=($!)
-fi
+$N/netd --vhost-user $W/vu.sock --guest-cid 3 --forward 127.0.0.1:15301=5301 >$W/netd.log 2>&1 & PIDS+=($!)
 for _ in $(seq 50); do [ -S $W/vu.sock ] && break; sleep 0.1; done
 ACCEL=tcg; [ -w /dev/kvm ] && ACCEL=kvm
 timeout 300 qemu-system-x86_64 -machine q35 -accel $ACCEL -smp 2 -m 1024 -nodefaults -display none \

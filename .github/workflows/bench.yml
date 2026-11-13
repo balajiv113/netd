@@ -28,7 +28,6 @@ jobs:
     timeout-minutes: 90
     env:
       DEBIAN_FRONTEND: noninteractive
-      VDV_LOG: warn
     steps:
       - uses: actions/checkout@v4
 
@@ -65,33 +64,14 @@ jobs:
           chmod +x "$RUNNER_TEMP/gvproxy"
           echo "GVPROXY=$RUNNER_TEMP/gvproxy" >> "$GITHUB_ENV"
 
-      - name: Cache vhost-device-vsock
-        id: vdv
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/vhost-device-vsock
-          key: vhost-device-vsock-0484a75-${{ hashFiles('bench/patches/vhost-device-vsock-*.patch') }}-${{ runner.os }}
-
-      # Upstream main + local fix for stranded guest->host data on EPOLLIN|EPOLLOUT
-      # (see bench/patches). 0.3.0 and main both stall netd-vu without it.
-      - name: Install vhost-device-vsock (patched)
-        if: steps.vdv.outputs.cache-hit != 'true'
-        run: |
-          git clone -q https://github.com/rust-vmm/vhost-device "$RUNNER_TEMP/vdv"
-          cd "$RUNNER_TEMP/vdv" && git checkout -q 0484a75df5c8e77a708af10b24dd34f596b25084
-          git apply "$GITHUB_WORKSPACE"/bench/patches/vhost-device-vsock-*.patch
-          cargo install --locked --path vhost-device-vsock
-
       - name: Build netd
         run: |
           cargo build --release
-          echo "VHOST_DEVICE_VSOCK=$HOME/.cargo/bin/vhost-device-vsock" >> "$GITHUB_ENV"
 
-      - name: Smoke test (netd vhost-user + vhost-device-vsock, minimal guest)
+      - name: Smoke test (netd, minimal guest)
         run: |
           sudo apt-get install -y -q cpio zstd >/dev/null
-          bench/vmtest/vmtest.sh embedded
-          bench/vmtest/vmtest.sh "$HOME/.cargo/bin/vhost-device-vsock"
+          bench/vmtest/vmtest.sh
 
       - name: Cache cloud image
         uses: actions/cache@v4
