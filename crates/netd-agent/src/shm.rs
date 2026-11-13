@@ -359,7 +359,7 @@ fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, id: Option<u32>, frames: &mut Frame
     let mut cnt = Counters::default();
     let start = Instant::now();
     let res = pump_loop(t, v, &mut tx, &mut rx, id, frames, &mut cnt);
-    if std::env::var_os("NETD_STATS").is_some() && cnt.bytes_in + cnt.bytes_out > 1 << 20 {
+    if cnt.bytes_in + cnt.bytes_out > 1 << 20 && std::env::var_os("NETD_STATS").is_some() {
         eprintln!("netd-agent: relay {:?} {cnt:?}", start.elapsed());
     }
     res
