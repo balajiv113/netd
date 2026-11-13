@@ -80,8 +80,6 @@ for the privileged reference contenders.
 Percentages are given against `native` (host loopback, unrestricted) and
 `native-cpu` (host loopback pinned to as many CPUs as the guest has vCPUs),
 the fairer bound when the runner has few cores.
-`--rounds N` runs all contenders N times, interleaved, and reports per-metric
-medians; shared CI runners are noisy enough to need it for A/B decisions.
 
 ## Prototype limitations
 

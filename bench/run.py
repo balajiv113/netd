@@ -26,7 +26,6 @@ import shlex
 import shutil
 import socket
 import subprocess
-import statistics
 import sys
 import time
 from pathlib import Path
@@ -561,28 +560,6 @@ def run_contender(name, args):
     return res
 
 
-def median_result(rounds):
-    """Per-metric median over rounds; the rounds are kept under "rounds"."""
-    if len(rounds) == 1:
-        return rounds[0]
-    return dict(median_of(rounds), rounds=rounds)
-
-
-def median_of(rounds):
-    out = {}
-    for k in dict.fromkeys(k for r in rounds for k in r):
-        vals = [r[k] for r in rounds if r.get(k) is not None]
-        if not vals:
-            out[k] = None
-        elif all(isinstance(v, (int, float)) for v in vals):
-            out[k] = statistics.median(vals)
-        elif all(isinstance(v, dict) for v in vals):
-            out[k] = median_of(vals)
-        else:
-            out[k] = vals[-1]
-    return out
-
-
 def fmt(v, native, pinned=None, unit=""):
     """Value with its share of native (and of native-cpu, when it ran)."""
     if v is None:
@@ -600,7 +577,7 @@ def report(results):
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name, r in results.items():
-        cells = [name + (f" (median of {len(r['rounds'])})" if "rounds" in r else "")]
+        cells = [name]
         for t in ("up1", "down1", "up4", "down4"):
             cells.append(fmt(r.get(t), nat.get(t), pin.get(t)))
         cells.append(fmt(r.get("fwd1"), nat.get("up1"), pin.get("up1")))
@@ -626,8 +603,6 @@ def main():
     ap.add_argument("--baseline", default=str(BASELINE), help="frozen results merged into the report ('' = none)")
     ap.add_argument("--secs", type=int, default=10)
     ap.add_argument("--vcpus", type=int, default=2)
-    ap.add_argument("--rounds", type=int, default=1,
-                    help="run all contenders this many times, interleaved, and report per-metric medians")
     ap.add_argument("--out", default=str(W / "results.json"))
     args = ap.parse_args()
     global ARGS_VCPUS
@@ -640,20 +615,17 @@ def main():
     server = subprocess.Popen(["iperf3", "-s", "-p", "5201"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     nb = subprocess.Popen([BIN / "nbench", "server", f"0.0.0.0:{NBENCH_PORT}"])
     time.sleep(0.5)
-    rounds = {name: [] for name in args.contenders}
     results = {}
     try:
-        for i in range(args.rounds):
-            for name in args.contenders:
-                log(f"=== {name}" + (f" (round {i + 1}/{args.rounds})" if args.rounds > 1 else ""))
-                if name == "native":
-                    rounds[name].append(run_native(args))
-                elif name == "native-cpu":
-                    rounds[name].append(run_native(args, pin=min(args.vcpus, os.cpu_count())))
-                else:
-                    rounds[name].append(run_contender(name, args))
-                results = {n: median_result(r) for n, r in rounds.items() if r}
-                Path(args.out).write_text(json.dumps(results, indent=2))
+        for name in args.contenders:
+            log(f"=== {name}")
+            if name == "native":
+                results[name] = run_native(args)
+            elif name == "native-cpu":
+                results[name] = run_native(args, pin=min(args.vcpus, os.cpu_count()))
+            else:
+                results[name] = run_contender(name, args)
+            Path(args.out).write_text(json.dumps(results, indent=2))
     finally:
         server.terminate()
         nb.terminate()
