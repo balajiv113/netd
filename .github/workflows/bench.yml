@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       contenders:
-        description: "space separated (empty = netd only vs frozen baseline; 'all' = rerun everything)"
+        description: "space separated (empty = native + netd, others from the frozen baseline; 'all' = rerun everything)"
         required: false
         default: ""
       secs:

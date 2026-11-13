@@ -566,8 +566,9 @@ def report(results):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("contenders", nargs="*", default=NETD,
-                    help="default: netd only; other contenders come from the frozen baseline ('all' = rerun everything); "
+    ap.add_argument("contenders", nargs="*", default=["native", *NETD],
+                    help="default: native and netd, so percentages compare against the same runner; other contenders "
+                         "come from the frozen baseline ('all' = rerun everything); "
                          "netd@AGENT_ARGS@NETD_ARGS (comma-separated) adds netd-agent / netd arguments")
     ap.add_argument("--baseline", default=str(BASELINE), help="frozen results merged into the report ('' = none)")
     ap.add_argument("--secs", type=int, default=10)
