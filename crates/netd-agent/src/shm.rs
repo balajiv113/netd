@@ -338,6 +338,10 @@ pub fn relay(tcp: OwnedFd, vs: OwnedFd, slot: Slot) -> io::Result<()> {
         if bell {
             // EAGAIN means netd has unread doorbells and will look anyway.
             unsafe { libc::write(v, [0u8].as_ptr().cast(), 1) };
+            // Before Linux 6.11, virtio-vsock hands every packet to a kworker
+            // on this CPU, which would only get to run once this thread
+            // blocks, i.e. after it filled or drained the whole ring.
+            unsafe { libc::sched_yield() };
         }
         if app_eof && wr_shut {
             // netd flushes whatever is left in the guest->host ring.
