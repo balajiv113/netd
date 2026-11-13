@@ -35,6 +35,7 @@ GUEST_IPERF_PORT = 5301
 NBENCH_PORT = 7000
 TAP = "nbtap0"
 
+ARGS_VCPUS = 2
 ALL = ["native", "tap-vhost", "slirp", "gvproxy", "passt", "passt-vu", "netd", "netd-vu", "netd-kvsock"]
 NETD = ["netd", "netd-vu", "netd-kvsock"]
 BASELINE = Path(__file__).resolve().parent / "baseline" / "linux-kvm.json"
@@ -376,7 +377,8 @@ class NetdEmbedded(NetdVU):
     def start_backend(self):
         (W / "netd-vu.sock").unlink(missing_ok=True)
         self.spawn([BIN / "netd", "--vhost-user", f"{W}/netd-vu.sock", "--guest-cid", "3",
-                    "--forward", f"127.0.0.1:{FWD_HOST_PORT}={GUEST_IPERF_PORT}"], "netd")
+                    "--forward", f"127.0.0.1:{FWD_HOST_PORT}={GUEST_IPERF_PORT}"], "netd",
+                   env={"NETD_STATS": "1"})
         wait_path(W / "netd-vu.sock")
 
     def qemu_net(self):
@@ -407,6 +409,25 @@ def measure(fn, pids):
     el = time.time() - t
     cpu = {p: round((cpu_seconds(p) - before[p]) / el, 2) for p in pids}
     return v, cpu
+
+
+STAT_FIELDS = ["user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal"]
+
+
+def guest_cpu_sample(g):
+    """Aggregate guest CPU jiffies from /proc/stat."""
+    _, out, _ = g.run("head -1 /proc/stat", timeout=10, check=False)
+    return [int(x) for x in out.split()[1:1 + len(STAT_FIELDS)]]
+
+
+def guest_cpu_delta(a, b):
+    """Busy cores per category between two samples (e.g. {'system': 0.8, ...})."""
+    d = [y - x for x, y in zip(a, b)]
+    total = sum(d) or 1
+    ncpu = ARGS_VCPUS
+    res = {k: round(v / total * ncpu, 2) for k, v in zip(STAT_FIELDS, d) if k != "idle" and v}
+    res["busy"] = round(sum(v for k, v in zip(STAT_FIELDS, d) if k not in ("idle", "iowait")) / total * ncpu, 2)
+    return res
 
 
 def run_native(args):
@@ -456,9 +477,11 @@ def run_contender(name, args):
                                    timeout=args.secs + 40, check=False)
                 return iperf_gbps(out or err)
             try:
+                s0 = guest_cpu_sample(g)
                 v, cpu = measure(go, list(pids.values()))
                 res[t] = v
                 res[t + "_cpu"] = {k: cpu[p] for k, p in pids.items()}
+                res[t + "_guest_cpu"] = guest_cpu_delta(s0, guest_cpu_sample(g))
             except Exception as e:  # keep going; record the failure
                 res[t] = None
                 res[t + "_error"] = str(e)[:300]
@@ -524,8 +547,8 @@ def fmt(v, native, unit=""):
 def report(results):
     nat = results.get("native", {})
     lines = [
-        "| contender | up1 Gbps | down1 Gbps | up4 Gbps | down4 Gbps | fwd1 Gbps | rr p50 µs | crr conn/s | host helper CPU (up1) | link MTU |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| contender | up1 Gbps | down1 Gbps | up4 Gbps | down4 Gbps | fwd1 Gbps | rr p50 µs | crr conn/s | host helper CPU (up1) | guest busy cores up1 / down1 | link MTU |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name, r in results.items():
         cells = [name]
@@ -538,6 +561,7 @@ def report(results):
         cpu = r.get("up1_cpu") or {}
         helpers = {k: v for k, v in cpu.items() if k != "qemu"}
         cells.append(", ".join(f"{k} {v}" for k, v in helpers.items()) + (f"; qemu {cpu['qemu']}" if "qemu" in cpu else ""))
+        cells.append(" / ".join(str((r.get(t + "_guest_cpu") or {}).get("busy", "")) for t in ("up1", "down1")).strip(" /"))
         cells.append(r.get("mtu", "host loopback"))
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
@@ -552,6 +576,8 @@ def main():
     ap.add_argument("--vcpus", type=int, default=2)
     ap.add_argument("--out", default=str(W / "results.json"))
     args = ap.parse_args()
+    global ARGS_VCPUS
+    ARGS_VCPUS = args.vcpus
     if args.contenders == ["all"]:
         args.contenders = ALL
 

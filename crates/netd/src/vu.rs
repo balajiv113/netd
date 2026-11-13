@@ -259,7 +259,26 @@ enum Rx {
     Starved,
 }
 
+/// Counters printed every second when NETD_STATS is set.
+#[derive(Default, Debug)]
+struct Stats {
+    wakeups: u64,
+    tx_pkts: u64,
+    tx_bytes: u64,
+    tx_buffered: u64,
+    rx_readv: u64,
+    rx_chains: u64,
+    rx_bytes: u64,
+    rx_starved: u64,
+    ctl_pkts: u64,
+    credit_updates: u64,
+    tx_irqs: u64,
+    rx_irqs: u64,
+}
+
 struct Dev {
+    stats: Stats,
+    stats_at: Option<std::time::Instant>,
     cid: u64,
     aliases: Vec<IpAddr>,
     listen_port: u32,
@@ -420,6 +439,8 @@ impl Dev {
             epoll_add(ep, l.as_raw_fd(), libc::EPOLLIN as u32, LISTENER_BIT | i as u64)?;
         }
         Ok(Dev {
+            stats: Stats::default(),
+            stats_at: std::env::var_os("NETD_STATS").map(|_| std::time::Instant::now()),
             cid: cfg.cid,
             aliases: cfg.aliases.clone(),
             listen_port: cfg.listen_port,
@@ -444,10 +465,25 @@ impl Dev {
         let Some(atomic) = self.mem.clone() else { return Ok(()) };
         let guard = atomic.memory();
         let mem: &Mem = &guard;
+        self.stats.wakeups += 1;
         self.poll_epoll();
         self.process_tx(&vrings[TXQ], mem)?;
         self.flush_tx_ready();
-        self.process_rx(&vrings[RXQ], mem)
+        self.process_rx(&vrings[RXQ], mem)?;
+        self.print_stats();
+        Ok(())
+    }
+
+    fn print_stats(&mut self) {
+        let Some(at) = self.stats_at else { return };
+        if at.elapsed().as_secs() < 1 {
+            return;
+        }
+        if self.stats.wakeups > 1 {
+            eprintln!("netd: stats {:?} conns={}", self.stats, self.conns.len());
+        }
+        self.stats = Stats::default();
+        self.stats_at = Some(std::time::Instant::now());
     }
 
     // ---- host sockets ----
@@ -684,6 +720,7 @@ impl Dev {
             loop {
                 segs.clear();
                 let Some(head) = pop_chain(&mut st, mem, false, &mut segs) else { break };
+                self.stats.tx_pkts += 1;
                 self.on_tx_packet(&segs);
                 let _ = st.add_used(head, 0);
                 used = true;
@@ -695,6 +732,7 @@ impl Dev {
         segs.clear();
         self.segs = segs;
         if used && st.needs_notification().map_err(io::Error::other)? {
+            self.stats.tx_irqs += 1;
             st.signal_used_queue()?;
         }
         Ok(())
@@ -757,6 +795,7 @@ impl Dev {
     }
 
     fn guest_data(&mut self, tok: u64, segs: &[Seg], mut off: usize, mut len: usize) {
+        self.stats.tx_bytes += len as u64;
         let c = self.conns.get_mut(&tok).unwrap();
         c.rx_cnt = c.rx_cnt.wrapping_add(len as u32);
         while len > 0 && matches!(c.state, State::ReadReq | State::AwaitStatus) {
@@ -829,6 +868,7 @@ impl Dev {
             c.txq.resize(at + len, 0);
             let buf = c.txq.make_contiguous();
             segs_read(segs, off, &mut buf[at..]);
+            self.stats.tx_buffered += len as u64;
             self.tx_ready.insert(tok);
         } else if len > 0 {
             c.fwd_cnt = c.fwd_cnt.wrapping_add(len as u32);
@@ -848,11 +888,16 @@ impl Dev {
             let _ = st.disable_notification();
             let starved = self.fill_rx(&mut st, mem, &mut used);
             // Ask for a kick only when buffers ran out with work pending.
-            if !starved || !st.enable_notification().map_err(io::Error::other)? {
+            if !starved {
+                break;
+            }
+            self.stats.rx_starved += 1;
+            if !st.enable_notification().map_err(io::Error::other)? {
                 break;
             }
         }
         if used && st.needs_notification().map_err(io::Error::other)? {
+            self.stats.rx_irqs += 1;
             st.signal_used_queue()?;
         }
         Ok(())
@@ -892,6 +937,10 @@ impl Dev {
                 let _ = st.add_used(head, HDR as u32);
                 *used = true;
                 self.segs = segs;
+                self.stats.ctl_pkts += 1;
+                if ctl.op == OP_CREDIT_UPDATE {
+                    self.stats.credit_updates += 1;
+                }
                 self.ctl.pop_front();
             }
             let toks: Vec<u64> = self.rx_ready.drain().collect();
@@ -990,6 +1039,8 @@ impl Dev {
         };
         let err = if n < 0 { errno() } else { 0 };
         let got = n.max(0) as usize;
+        self.stats.rx_readv += 1;
+        self.stats.rx_bytes += got as u64;
         let mut rem = got;
         let mut nused = 0u16;
         for &(head, s0, s1, cap) in &chains {
@@ -1003,6 +1054,7 @@ impl Dev {
             rem -= k;
             nused += 1;
         }
+        self.stats.rx_chains += u64::from(nused);
         // Hand unused chains back to the queue.
         st.get_queue_mut().set_next_avail(start.wrapping_add(nused));
         self.segs = segs;
