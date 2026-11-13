@@ -69,6 +69,8 @@ const F_OPEN: u8 = b'O';
 const F_CLOSE: u8 = b'C';
 const F_RESET: u8 = b'R';
 const F_FAIL: u8 = b'F';
+/// Largest slot frame: an Open with an IPv6 destination.
+pub const MAX_FRAME_LEN: usize = 24;
 
 /// A message on a slot stream.
 ///
@@ -95,16 +97,23 @@ fn bad(m: &str) -> io::Error {
 
 /// family port(be16) addr(4 or 16 bytes)
 fn encode_addr(a: SocketAddr, b: &mut Vec<u8>) {
+    let mut addr = [0u8; 19];
+    let len = encode_addr_into(a, &mut addr);
+    b.extend_from_slice(&addr[..len]);
+}
+
+fn encode_addr_into(a: SocketAddr, b: &mut [u8]) -> usize {
+    b[1..3].copy_from_slice(&a.port().to_be_bytes());
     match a.ip() {
         IpAddr::V4(ip) => {
-            b.push(4);
-            b.extend_from_slice(&a.port().to_be_bytes());
-            b.extend_from_slice(&ip.octets());
+            b[0] = 4;
+            b[3..7].copy_from_slice(&ip.octets());
+            7
         }
         IpAddr::V6(ip) => {
-            b.push(6);
-            b.extend_from_slice(&a.port().to_be_bytes());
-            b.extend_from_slice(&ip.octets());
+            b[0] = 6;
+            b[3..19].copy_from_slice(&ip.octets());
+            19
         }
     }
 }
@@ -173,21 +182,43 @@ impl Frame {
     }
 
     pub fn encode(&self, b: &mut Vec<u8>) {
-        match *self {
-            Frame::Bell => b.push(F_BELL),
-            Frame::Open { id, dst } => {
-                b.push(F_OPEN);
-                b.extend_from_slice(&id.to_be_bytes());
-                encode_addr(dst, b);
-            }
-            Frame::Close => b.push(F_CLOSE),
-            Frame::Reset => b.push(F_RESET),
-            Frame::Fail { id, errno } => {
-                b.push(F_FAIL);
-                b.extend_from_slice(&id.to_be_bytes());
-                b.extend_from_slice(&errno.to_be_bytes());
-            }
+        if *self == Frame::Bell {
+            b.push(F_BELL);
+            return;
         }
+        let (bytes, len) = self.encode_fixed();
+        b.extend_from_slice(&bytes[..len]);
+    }
+
+    /// Encode without allocating, for short control messages on a slot stream.
+    pub fn encode_fixed(&self) -> ([u8; MAX_FRAME_LEN], usize) {
+        let mut b = [0u8; MAX_FRAME_LEN];
+        let len = match *self {
+            Frame::Bell => {
+                b[0] = F_BELL;
+                1
+            }
+            Frame::Open { id, dst } => {
+                b[0] = F_OPEN;
+                b[1..5].copy_from_slice(&id.to_be_bytes());
+                5 + encode_addr_into(dst, &mut b[5..])
+            }
+            Frame::Close => {
+                b[0] = F_CLOSE;
+                1
+            }
+            Frame::Reset => {
+                b[0] = F_RESET;
+                1
+            }
+            Frame::Fail { id, errno } => {
+                b[0] = F_FAIL;
+                b[1..5].copy_from_slice(&id.to_be_bytes());
+                b[5..9].copy_from_slice(&errno.to_be_bytes());
+                9
+            }
+        };
+        (b, len)
     }
 }
 
@@ -388,6 +419,26 @@ mod tests {
             assert_eq!(got, frames, "chunks of {step}");
         }
         assert!(FrameReader::default().feed(b"X", |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn fixed_frames_have_the_expected_wire_format() {
+        let cases = [
+            (Frame::Bell, vec![0]),
+            (Frame::Close, vec![b'C']),
+            (Frame::Reset, vec![b'R']),
+            (Frame::Fail { id: 1, errno: 111 }, vec![b'F', 0, 0, 0, 1, 0, 0, 0, 111]),
+            (Frame::Open { id: 7, dst: "1.2.3.4:80".parse().unwrap() }, vec![b'O', 0, 0, 0, 7, 4, 0, 80, 1, 2, 3, 4]),
+            (
+                Frame::Open { id: 7, dst: "[2001:db8::1]:443".parse().unwrap() },
+                vec![b'O', 0, 0, 0, 7, 6, 1, 187, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            ),
+        ];
+        for (frame, expected) in cases {
+            let (bytes, len) = frame.encode_fixed();
+            assert_eq!(&bytes[..len], expected);
+            assert_eq!(Frame::parse(&bytes[..len]).unwrap(), frame);
+        }
     }
 
     #[test]

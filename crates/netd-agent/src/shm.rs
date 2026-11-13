@@ -314,15 +314,20 @@ fn io_result(n: isize) -> io::Result<Io> {
 
 /// Writes a whole frame to a non-blocking stream.
 fn send(v: RawFd, f: Frame) -> io::Result<()> {
-    let mut b = Vec::with_capacity(32);
-    f.encode(&mut b);
+    let (b, len) = f.encode_fixed();
     let mut off = 0;
-    while off < b.len() {
-        match io_result(unsafe { libc::write(v, b[off..].as_ptr().cast(), b.len() - off) })? {
+    while off < len {
+        match io_result(unsafe { libc::write(v, b[off..len].as_ptr().cast(), len - off) })? {
+            Io::Done(0) => return Err(io::ErrorKind::WriteZero.into()),
             Io::Done(n) => off += n,
             Io::Blocked => {
                 let mut p = libc::pollfd { fd: v, events: libc::POLLOUT, revents: 0 };
-                unsafe { libc::poll(&mut p, 1, -1) };
+                if unsafe { libc::poll(&mut p, 1, -1) } < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() != io::ErrorKind::Interrupted {
+                        return Err(e);
+                    }
+                }
             }
         }
     }
