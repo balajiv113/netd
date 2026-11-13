@@ -17,8 +17,9 @@ use netd_common::proto::{self, Frame, FrameReader, ShmRegion};
 use netd_common::shm::{CHUNK, Consumer, HOST_TO_GUEST_CHUNK, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_CTL, SlotCtl};
 
 static SPIN_US: AtomicU64 = AtomicU64::new(50);
-static STARTUP_SPIN_US: AtomicU64 = AtomicU64::new(200);
-const STARTUP_LIMIT: u64 = 256 * 1024;
+static INTERACTIVE_SPIN_US: AtomicU64 = AtomicU64::new(200);
+const UNANSWERED_LIMIT: u64 = 256 * 1024;
+const BULK_IO_SIZE: usize = 16 * 1024;
 
 /// Per-relay counters, logged when a relay ends if NETD_STATS is set.
 #[derive(Default, Debug)]
@@ -38,7 +39,7 @@ struct Counters {
 /// How long a relay busy-polls for new work before it sleeps (0 = never).
 pub fn set_spin_us(us: u64) {
     SPIN_US.store(us, Ordering::Relaxed);
-    STARTUP_SPIN_US.store(us, Ordering::Relaxed);
+    INTERACTIVE_SPIN_US.store(us, Ordering::Relaxed);
 }
 
 pub struct Region {
@@ -384,6 +385,8 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Optio
     let iov = &mut [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
     let mut app_eof = false;
     let mut wr_shut = false;
+    let mut bulk_traffic = false;
+    let mut bytes_at_response = 0;
     loop {
         // Doorbells, and netd's verdict on this connection. Bells and Fail
         // frames left over from the slot's earlier connections are ignored.
@@ -407,6 +410,7 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Optio
                 Io::Done(r) => {
                     cnt.reads += 1;
                     cnt.bytes_in += r as u64;
+                    bulk_traffic |= r >= BULK_IO_SIZE;
                     if tx.commit(r) {
                         doorbell(v);
                     }
@@ -439,6 +443,8 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Optio
                 Io::Done(w) => {
                     cnt.writes += 1;
                     cnt.bytes_out += w as u64;
+                    bulk_traffic |= w >= BULK_IO_SIZE;
+                    bytes_at_response = cnt.bytes_in;
                     if rx.consume(w) {
                         doorbell(v);
                     }
@@ -475,10 +481,10 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Optio
         let bulk = ring_in || want_out;
         let spin_us = spin_budget(
             SPIN_US.load(Ordering::Relaxed),
-            STARTUP_SPIN_US.load(Ordering::Relaxed),
+            INTERACTIVE_SPIN_US.load(Ordering::Relaxed),
             id.is_some(),
-            cnt.bytes_in,
-            cnt.bytes_out,
+            bulk_traffic,
+            cnt.bytes_in.saturating_sub(bytes_at_response),
         );
         if !bulk && spin(rx, ring_out, t, tev, spin_us)? {
             cnt.spin_hits += 1;
@@ -522,8 +528,8 @@ fn doorbell(v: RawFd) {
     unsafe { libc::sched_yield() };
 }
 
-fn spin_budget(steady: u64, startup: u64, outbound: bool, bytes_in: u64, bytes_out: u64) -> u64 {
-    if outbound && bytes_out == 0 && bytes_in < STARTUP_LIMIT { startup } else { steady }
+fn spin_budget(steady: u64, interactive: u64, outbound: bool, bulk: bool, bytes_since_response: u64) -> u64 {
+    if outbound && !bulk && bytes_since_response < UNANSWERED_LIMIT { interactive } else { steady }
 }
 
 /// Busy-polls the rings (and the application socket) for a short while.
@@ -555,12 +561,12 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     #[test]
-    fn startup_spin_ends_after_response_or_bulk_data() {
-        assert_eq!(spin_budget(50, 200, true, 5, 0), 200);
-        assert_eq!(spin_budget(50, 200, true, 5, 1), 50);
-        assert_eq!(spin_budget(50, 200, true, STARTUP_LIMIT, 0), 50);
-        assert_eq!(spin_budget(50, 200, false, 0, 0), 50);
-        assert_eq!(spin_budget(0, 0, true, 0, 0), 0);
+    fn interactive_spin_stops_for_bulk_or_unanswered_data() {
+        assert_eq!(spin_budget(50, 200, true, false, 5), 200);
+        assert_eq!(spin_budget(50, 200, true, true, 5), 50);
+        assert_eq!(spin_budget(50, 200, true, false, UNANSWERED_LIMIT), 50);
+        assert_eq!(spin_budget(50, 200, false, false, 0), 50);
+        assert_eq!(spin_budget(0, 0, true, false, 0), 0);
     }
 
     #[test]
