@@ -487,6 +487,7 @@ struct Dev {
     shm_ready: HashSet<u64>,
     shm: Option<ShmTable>,
     busy_poll: Duration,
+    /// Rings may be unarmed across a yield; re-arm all before sleeping.
     polling: bool,
     yield_fd: OwnedFd,
     segs: Vec<Seg>,
@@ -717,6 +718,7 @@ impl Dev {
     }
 
     fn should_poll(&self) -> bool {
+        // A bulk connection must not keep an unrelated idle ring polling.
         let bulk_present = self.conns.values().any(|c| c.shm.is_some() && c.bulk);
         let now = Instant::now();
         self.conns.values().any(|c| c.poll_eligible(now, self.busy_poll, bulk_present))
@@ -1759,5 +1761,56 @@ mod tests {
         assert!(!c.poll_eligible(now, Duration::ZERO, false));
         c.bulk = true;
         assert!(!c.poll_eligible(now, budget, true));
+    }
+
+    #[test]
+    fn polling_yield_arms_idle_ring_before_sleep() {
+        let cfg = Config {
+            cid: 3,
+            aliases: Vec::new(),
+            listen_port: 1024,
+            guest_port: 1025,
+            forwards: Vec::new(),
+            busy_poll: Duration::from_micros(50),
+        };
+        let mut dev = Dev::new(&cfg, Arc::new(Vec::new())).unwrap();
+        let mem = GuestMemoryAtomic::new(GuestMemoryMmap::new());
+        dev.mem = Some(mem.clone());
+        let vrings: Vec<_> = (0..NUM_QUEUES).map(|_| VringRwLock::new(mem.clone(), 256).unwrap()).collect();
+
+        let ctl1: Box<SlotCtl> = Box::new(unsafe { std::mem::zeroed() });
+        let ctl2: Box<SlotCtl> = Box::new(unsafe { std::mem::zeroed() });
+        ctl1.claim();
+        ctl2.claim();
+        let mut a = vec![0u8; RING_SIZE];
+        let mut b = vec![0u8; RING_SIZE];
+        let mut c = vec![0u8; RING_SIZE];
+        let mut d = vec![0u8; RING_SIZE];
+        let a = unsafe { Ring::new(&ctl1.g2h, a.as_mut_ptr()) };
+        let b = unsafe { Ring::new(&ctl1.h2g, b.as_mut_ptr()) };
+        let c = unsafe { Ring::new(&ctl2.g2h, c.as_mut_ptr()) };
+        let d = unsafe { Ring::new(&ctl2.h2g, d.as_mut_ptr()) };
+        let mut guest = Producer::new(a);
+        let mut blocked_guest = Producer::new(c);
+        blocked_guest.commit(1);
+
+        let raw1 = unsafe { libc::memfd_create(c"netd-poll-test".as_ptr(), libc::MFD_CLOEXEC) };
+        let raw2 = unsafe { libc::memfd_create(c"netd-poll-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw1 >= 0 && raw2 >= 0);
+        let mut idle = Conn::new(1, 2, State::Relay);
+        idle.sock = Some(unsafe { OwnedFd::from_raw_fd(raw1) });
+        idle.shm = Some(ShmConn { slot: 0, ctl: &*ctl1, tx: Consumer::new(a), rx: Producer::new(b) });
+        idle.writable = true;
+        idle.last_activity = Instant::now() - cfg.busy_poll;
+        let mut blocked = Conn::new(3, 4, State::Relay);
+        blocked.sock = Some(unsafe { OwnedFd::from_raw_fd(raw2) });
+        blocked.shm = Some(ShmConn { slot: 1, ctl: &*ctl2, tx: Consumer::new(c), rx: Producer::new(d) });
+        blocked.bulk = true;
+        dev.add_conn(idle);
+        dev.add_conn(blocked);
+        dev.polling = true;
+        dev.run(&vrings).unwrap();
+        assert!(!dev.polling);
+        assert!(guest.commit(1));
     }
 }
