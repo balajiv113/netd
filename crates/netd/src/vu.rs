@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netd_common::proto::{self, Frame, FrameReader, Msg, PROTO_TCP, Request, STATUS_LEN, ShmRegion};
-use netd_common::shm::{CHUNK, Consumer, HOST_TO_GUEST_CHUNK, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
+use netd_common::shm::{Consumer, HOST_TO_GUEST_CHUNK, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringRwLock, VringState, VringT};
 use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
@@ -59,6 +59,8 @@ const SHUT_SEND: u32 = 2;
 const BUF_ALLOC: u32 = 4 << 20;
 /// Upper bound of host->guest bytes moved by one readv.
 const RX_BATCH: usize = 1 << 20;
+/// Maximum guest-to-host ring data submitted in one socket write.
+const SHM_TX_BATCH: usize = RING_SIZE / 4;
 const LISTENER_BIT: u64 = 1 << 63;
 /// epoll token of the eventfd the worker uses to reschedule itself.
 const YIELD_TOK: u64 = 0;
@@ -319,7 +321,7 @@ impl Conn {
         let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
         loop {
             while self.writable && !self.wr_shut {
-                let (k, n) = s.tx.data_iov(&mut iov, CHUNK)?;
+                let (k, n) = s.tx.data_iov(&mut iov, SHM_TX_BATCH)?;
                 if n == 0 {
                     if s.tx.finished()? {
                         unsafe { libc::shutdown(fd, libc::SHUT_WR) };
@@ -1691,4 +1693,32 @@ mod tests {
         assert_eq!(&b[..3], b"llo");
     }
 
+    #[test]
+    fn shared_ring_pump_batches_published_uploads() {
+        let ctl: Box<SlotCtl> = Box::new(unsafe { std::mem::zeroed() });
+        ctl.claim();
+        let mut g2h_data = vec![0u8; RING_SIZE];
+        let mut h2g_data = vec![0u8; RING_SIZE];
+        let g2h = unsafe { Ring::new(&ctl.g2h, g2h_data.as_mut_ptr()) };
+        let h2g = unsafe { Ring::new(&ctl.h2g, h2g_data.as_mut_ptr()) };
+        let mut guest = Producer::new(g2h);
+        let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+        for _ in 0..2 {
+            let (_, n) = guest.free_iov(&mut iov, netd_common::shm::CHUNK).unwrap();
+            unsafe { std::ptr::write_bytes(iov[0].iov_base, 7, n) };
+            guest.commit(n);
+        }
+
+        let raw = unsafe { libc::memfd_create(c"netd-batch-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let mut c = Conn::new(1, 2, State::Relay);
+        c.sock = Some(unsafe { OwnedFd::from_raw_fd(raw) });
+        c.shm = Some(ShmConn { slot: 0, ctl: &*ctl, tx: Consumer::new(g2h), rx: Producer::new(h2g) });
+        c.writable = true;
+        let mut stats = Stats::default();
+        c.pump_shm(&mut stats, false).unwrap();
+        assert_eq!(stats.shm_tx_bytes, SHM_TX_BATCH as u64);
+        assert_eq!(stats.shm_tx_writes, 1);
+        assert_eq!(c.shm.as_ref().unwrap().tx.avail().unwrap(), 0);
+    }
 }

@@ -43,8 +43,9 @@ both budgets. Set either option to zero to disable polling on that side.
 Both only poll while waiting for data: a side blocked by a full ring or
 socket is in a bulk transfer and sleeps until the peer has freed half the
 ring, rather than taking CPU from the peer that has to make room. Payload
-moves in chunks of up to 256 KiB guest-to-host or 512 KiB host-to-guest,
-each published as soon as it is copied, so both sides copy at the same time.
+is published in chunks of up to 256 KiB guest-to-host or 512 KiB
+host-to-guest, so both sides copy at the same time. The host can combine
+published guest-to-host chunks into a 512 KiB socket write.
 
 Connection setup avoids round trips too. Each ring slot has one persistent
 vsock stream, opened when the rings are registered, and the slot's
