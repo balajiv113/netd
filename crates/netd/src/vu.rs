@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netd_common::proto::{self, Frame, FrameReader, Msg, PROTO_TCP, Request, STATUS_LEN, ShmRegion};
-use netd_common::shm::{CHUNK, Consumer, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
+use netd_common::shm::{CHUNK, Consumer, HOST_TO_GUEST_CHUNK, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringRwLock, VringState, VringT};
 use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
@@ -350,7 +350,7 @@ impl Conn {
                 }
             }
             while self.readable && !self.sock_eof && !self.guest_shut_rcv {
-                let (k, n) = s.rx.free_iov(&mut iov, CHUNK)?;
+                let (k, n) = s.rx.free_iov(&mut iov, HOST_TO_GUEST_CHUNK)?;
                 if n == 0 {
                     stats.shm_rx_ring_full += 1;
                     break;

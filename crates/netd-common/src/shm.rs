@@ -28,7 +28,9 @@ pub const RING_SIZE: usize = HUGEPAGE;
 /// Largest transfer either side makes between two ring updates. Committing in
 /// pieces lets the peer work on the ring concurrently instead of waiting for a
 /// whole ring's worth of data (or space) to turn over.
-pub const CHUNK: usize = RING_SIZE / 4;
+pub const CHUNK: usize = RING_SIZE / 8;
+/// Larger batches amortize host socket reads during host-to-guest transfers.
+pub const HOST_TO_GUEST_CHUNK: usize = RING_SIZE / 4;
 /// A waiting producer is only woken once this much space is free, so a full
 /// ring costs one doorbell per half turn rather than one per chunk, while the
 /// consumer keeps draining the other half.

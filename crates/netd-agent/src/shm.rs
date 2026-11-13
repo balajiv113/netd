@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netd_common::proto::{self, Frame, FrameReader, ShmRegion};
-use netd_common::shm::{CHUNK, Consumer, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_CTL, SlotCtl};
+use netd_common::shm::{CHUNK, Consumer, HOST_TO_GUEST_CHUNK, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_CTL, SlotCtl};
 
 static SPIN_US: AtomicU64 = AtomicU64::new(50);
 static STARTUP_SPIN_US: AtomicU64 = AtomicU64::new(200);
@@ -418,7 +418,7 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Optio
         // ring -> application
         let mut want_out = false;
         while !wr_shut {
-            let (k, n) = rx.data_iov(iov, CHUNK)?;
+            let (k, n) = rx.data_iov(iov, HOST_TO_GUEST_CHUNK)?;
             if n == 0 {
                 if rx.finished()? {
                     unsafe { libc::shutdown(t, libc::SHUT_WR) };
