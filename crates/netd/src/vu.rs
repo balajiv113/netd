@@ -80,6 +80,8 @@ pub struct Config {
     /// How long the worker keeps polling shared rings after the last work
     /// before it sleeps (zero = event driven only).
     pub busy_poll: Duration,
+    /// Polling budget before the first response or bulk transfer.
+    pub startup_busy_poll: Duration,
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
@@ -256,6 +258,8 @@ struct Conn {
     shm: Option<ShmConn>,
     /// The last pump stopped at a full ring or socket (see pump_shm).
     bulk: bool,
+    startup: bool,
+    startup_tx_bytes: usize,
 }
 
 impl Conn {
@@ -287,6 +291,8 @@ impl Conn {
             frames: FrameReader::default(),
             shm: None,
             bulk: false,
+            startup: false,
+            startup_tx_bytes: 0,
         }
     }
 
@@ -301,6 +307,8 @@ impl Conn {
         self.wr_shut = false;
         self.guest_done = false;
         self.bulk = false;
+        self.startup = false;
+        self.startup_tx_bytes = 0;
     }
 
     fn peer_credit(&self) -> usize {
@@ -341,6 +349,12 @@ impl Conn {
                 }
                 stats.shm_tx_bytes += w as u64;
                 stats.shm_tx_writes += 1;
+                if self.startup {
+                    self.startup_tx_bytes = self.startup_tx_bytes.saturating_add(w as usize);
+                    if self.startup_tx_bytes >= CHUNK {
+                        self.startup = false;
+                    }
+                }
                 if (w as usize) < n {
                     stats.shm_tx_sock_full += 1;
                     self.writable = false;
@@ -373,6 +387,7 @@ impl Conn {
                 }
                 stats.shm_rx_bytes += r as u64;
                 stats.shm_rx_reads += 1;
+                self.startup = false;
                 if (r as usize) < n {
                     self.readable = false;
                 }
@@ -478,6 +493,7 @@ struct Dev {
     shm_ready: HashSet<u64>,
     shm: Option<ShmTable>,
     busy_poll: Duration,
+    startup_busy_poll: Duration,
     yield_fd: OwnedFd,
     segs: Vec<Seg>,
     iov: Vec<libc::iovec>,
@@ -641,6 +657,7 @@ impl Dev {
             shm_ready: HashSet::new(),
             shm: None,
             busy_poll: cfg.busy_poll,
+            startup_busy_poll: cfg.startup_busy_poll,
             yield_fd,
             segs: Vec::with_capacity(512),
             iov: Vec::with_capacity(512),
@@ -661,7 +678,19 @@ impl Dev {
             self.flush_tx_ready();
             // While busy-polling, the rings are serviced without arming their
             // wait flags, so the agent has no reason to ring the doorbell.
-            let busy = !self.busy_poll.is_zero() && self.conns.values().any(|c| c.shm.is_some() && !c.bulk);
+            let mut active = false;
+            let mut startup = false;
+            for c in self.conns.values() {
+                if c.shm.is_some() && !c.bulk {
+                    active = true;
+                    if c.startup {
+                        startup = true;
+                        break;
+                    }
+                }
+            }
+            let poll_budget = if startup { self.startup_busy_poll } else { self.busy_poll };
+            let busy = !poll_budget.is_zero() && active;
             let toks: Vec<u64> = if busy { self.shm_conns() } else { self.shm_ready.iter().copied().collect() };
             self.shm_ready.clear();
             self.pump_shm(toks, !busy);
@@ -681,7 +710,7 @@ impl Dev {
                 unsafe { libc::eventfd_write(self.yield_fd.as_raw_fd(), 1) };
                 break;
             }
-            if last_work.elapsed() >= self.busy_poll {
+            if last_work.elapsed() >= poll_budget {
                 // Idle: arm the rings and sleep, unless arming found work.
                 let before = self.stats.work();
                 let toks = self.shm_conns();
@@ -914,6 +943,7 @@ impl Dev {
             }
             (Frame::Open { id, dst }, State::SlotIdle) => {
                 c.conn_id = id;
+                c.startup = true;
                 self.start_connect(tok, Request::tcp(dst, NO_SLOT));
             }
             // A connection netd already ended (Fail) or that has not started.
@@ -1628,9 +1658,9 @@ impl VhostUserBackend for Backend {
 /// Serves the vhost-user socket forever; a new device is created for every
 /// frontend (QEMU) connection.
 pub fn serve(socket: &str, cfg: Config) -> ! {
-    let Config { cid, aliases, listen_port, guest_port, forwards, busy_poll } = cfg;
+    let Config { cid, aliases, listen_port, guest_port, forwards, busy_poll, startup_busy_poll } = cfg;
     let forwards = Arc::new(forwards);
-    let cfg = Config { cid, aliases, listen_port, guest_port, forwards: Vec::new(), busy_poll };
+    let cfg = Config { cid, aliases, listen_port, guest_port, forwards: Vec::new(), busy_poll, startup_busy_poll };
     loop {
         if let Err(e) = serve_once(socket, &cfg, forwards.clone()) {
             eprintln!("netd: vhost-user: {e}");
@@ -1657,6 +1687,8 @@ fn serve_once(socket: &str, cfg: &Config, forwards: Arc<Vec<(TcpListener, u16)>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn header_roundtrip() {
@@ -1691,4 +1723,49 @@ mod tests {
         assert_eq!(&b[..3], b"llo");
     }
 
+    #[test]
+    fn startup_poll_ends_on_response_and_resets_on_reuse() {
+        let ctl: Box<SlotCtl> = Box::new(unsafe { std::mem::zeroed() });
+        ctl.claim();
+        let mut g2h_data = vec![0u8; RING_SIZE];
+        let mut h2g_data = vec![0u8; RING_SIZE];
+        let g2h = unsafe { Ring::new(&ctl.g2h, g2h_data.as_mut_ptr()) };
+        let h2g = unsafe { Ring::new(&ctl.h2g, h2g_data.as_mut_ptr()) };
+        let mut guest = Producer::new(g2h);
+        let (sock, mut server) = UnixStream::pair().unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let mut c = Conn::new(1, 2, State::Relay);
+        c.sock = Some(sock.into());
+        c.shm = Some(ShmConn { slot: 0, ctl: &*ctl, tx: Consumer::new(g2h), rx: Producer::new(h2g) });
+        c.startup = true;
+        c.writable = true;
+        c.readable = true;
+        let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+        guest.free_iov(&mut iov, CHUNK).unwrap();
+        unsafe { std::ptr::copy_nonoverlapping(b"hello".as_ptr(), iov[0].iov_base.cast(), 5) };
+        guest.commit(5);
+
+        c.pump_shm(&mut Stats::default(), false).unwrap();
+        assert!(c.startup);
+        server.read_exact(&mut [0u8; 5]).unwrap();
+        server.write_all(b"x").unwrap();
+        c.readable = true;
+        c.pump_shm(&mut Stats::default(), false).unwrap();
+        assert!(!c.startup);
+        c.startup = true;
+        c.startup_tx_bytes = 0;
+        let chunk = [7u8; 16 * 1024];
+        for _ in 0..CHUNK / chunk.len() {
+            guest.free_iov(&mut iov, chunk.len()).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), iov[0].iov_base.cast(), chunk.len()) };
+            guest.commit(chunk.len());
+            c.pump_shm(&mut Stats::default(), false).unwrap();
+            server.read_exact(&mut [0u8; 16 * 1024]).unwrap();
+        }
+        assert!(!c.startup);
+        c.startup = true;
+        c.clear_conn();
+        assert!(!c.startup);
+        assert_eq!(c.startup_tx_bytes, 0);
+    }
 }
