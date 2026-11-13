@@ -29,6 +29,10 @@ pub const RING_SIZE: usize = HUGEPAGE;
 /// pieces lets the peer work on the ring concurrently instead of waiting for a
 /// whole ring's worth of data (or space) to turn over.
 pub const CHUNK: usize = RING_SIZE / 8;
+/// A waiting producer is only woken once this much space is free, so a full
+/// ring costs one doorbell per half turn rather than one per chunk, while the
+/// consumer keeps draining the other half.
+pub const WAKE_SPACE: usize = RING_SIZE / 2;
 pub const SLOT_CTL: usize = 1024;
 pub const MAX_SLOTS: usize = HUGEPAGE / SLOT_CTL;
 pub const NO_SLOT: u16 = u16::MAX;
@@ -172,13 +176,13 @@ impl Producer {
         c.cons_wait.0.swap(0, Ordering::Relaxed) != 0
     }
 
-    /// Asks to be woken when space frees up. Returns false (and withdraws the
-    /// request) if there already is space.
+    /// Asks to be woken when WAKE_SPACE is free. Returns false (and withdraws
+    /// the request) if it already is.
     pub fn wait(&self) -> io::Result<bool> {
         let c = self.ring.ctl();
         c.prod_wait.0.store(1, Ordering::Relaxed);
         fence(Ordering::SeqCst);
-        if self.space()? > 0 {
+        if self.space()? >= WAKE_SPACE {
             c.prod_wait.0.store(0, Ordering::Relaxed);
             return Ok(false);
         }
@@ -217,7 +221,13 @@ impl Consumer {
         let c = self.ring.ctl();
         c.head.0.store(self.head, Ordering::Release);
         fence(Ordering::SeqCst);
-        c.prod_wait.0.swap(0, Ordering::Relaxed) != 0
+        if c.prod_wait.0.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        // A corrupt tail counts as no space: the producer is not woken.
+        let used = c.tail.0.load(Ordering::Acquire).wrapping_sub(self.head);
+        RING_SIZE.saturating_sub(used.min(RING_SIZE as u64) as usize) >= WAKE_SPACE
+            && c.prod_wait.0.swap(0, Ordering::Relaxed) != 0
     }
 
     /// The producer closed the stream and everything has been read.
@@ -301,7 +311,10 @@ mod tests {
         let (_m, mut p, mut c) = ring();
         assert_eq!(write(&mut p, &vec![1u8; RING_SIZE + 5]), RING_SIZE);
         assert!(p.wait().unwrap());
-        assert!(c.consume(1));
+        // Below WAKE_SPACE the producer keeps sleeping.
+        assert!(!c.consume(1));
+        assert!(p.wait().unwrap());
+        assert!(c.consume(WAKE_SPACE - 1));
         assert!(!p.wait().unwrap());
     }
 
