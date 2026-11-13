@@ -258,7 +258,6 @@ struct Conn {
     shm: Option<ShmConn>,
     /// The last pump stopped at a full ring or socket (see pump_shm).
     bulk: bool,
-    last_activity: Instant,
 }
 
 impl Conn {
@@ -290,7 +289,6 @@ impl Conn {
             frames: FrameReader::default(),
             shm: None,
             bulk: false,
-            last_activity: Instant::now(),
         }
     }
 
@@ -310,11 +308,6 @@ impl Conn {
     fn peer_credit(&self) -> usize {
         let inflight = self.tx_cnt.wrapping_sub(self.peer_fwd_cnt);
         self.peer_buf_alloc.saturating_sub(inflight) as usize
-    }
-
-    fn poll_eligible(&self, now: Instant, budget: Duration, bulk_present: bool) -> bool {
-        self.shm.is_some() && !self.bulk && !budget.is_zero()
-            && (!bulk_present || now.duration_since(self.last_activity) < budget)
     }
 
     /// Moves payload between the host socket and the shared rings until
@@ -487,8 +480,6 @@ struct Dev {
     shm_ready: HashSet<u64>,
     shm: Option<ShmTable>,
     busy_poll: Duration,
-    /// Rings may be unarmed across a yield; re-arm all before sleeping.
-    polling: bool,
     yield_fd: OwnedFd,
     segs: Vec<Seg>,
     iov: Vec<libc::iovec>,
@@ -652,7 +643,6 @@ impl Dev {
             shm_ready: HashSet::new(),
             shm: None,
             busy_poll: cfg.busy_poll,
-            polling: false,
             yield_fd,
             segs: Vec::with_capacity(512),
             iov: Vec::with_capacity(512),
@@ -673,19 +663,17 @@ impl Dev {
             self.flush_tx_ready();
             // While busy-polling, the rings are serviced without arming their
             // wait flags, so the agent has no reason to ring the doorbell.
-            let busy = self.should_poll();
-            let toks: Vec<u64> = if busy || self.polling { self.shm_conns() } else { self.shm_ready.iter().copied().collect() };
+            let busy = !self.busy_poll.is_zero() && self.conns.values().any(|c| c.shm.is_some() && !c.bulk);
+            let toks: Vec<u64> = if busy { self.shm_conns() } else { self.shm_ready.iter().copied().collect() };
             self.shm_ready.clear();
             self.pump_shm(toks, !busy);
             self.process_rx(&vrings[RXQ], mem)?;
             if !busy {
-                self.polling = false;
-                if self.shm_ready.is_empty() && !self.should_poll() {
+                if self.shm_ready.is_empty() {
                     break;
                 }
                 continue;
             }
-            self.polling = true;
             self.stats.busy_polls += 1;
             if self.stats.work() != before {
                 last_work = Instant::now();
@@ -701,8 +689,7 @@ impl Dev {
                 let toks = self.shm_conns();
                 self.pump_shm(toks, true);
                 self.process_rx(&vrings[RXQ], mem)?;
-                if self.stats.work() == before && self.shm_ready.is_empty() {
-                    self.polling = false;
+                if self.stats.work() == before {
                     break;
                 }
                 last_work = Instant::now();
@@ -715,13 +702,6 @@ impl Dev {
 
     fn shm_conns(&self) -> Vec<u64> {
         self.conns.iter().filter(|(_, c)| c.shm.is_some()).map(|(&t, _)| t).collect()
-    }
-
-    fn should_poll(&self) -> bool {
-        // A bulk connection must not keep an unrelated idle ring polling.
-        let bulk_present = self.conns.values().any(|c| c.shm.is_some() && c.bulk);
-        let now = Instant::now();
-        self.conns.values().any(|c| c.poll_eligible(now, self.busy_poll, bulk_present))
     }
 
     fn print_stats(&mut self) {
@@ -776,7 +756,6 @@ impl Dev {
                     }
                 }
                 if c.shm.is_some() {
-                    c.last_activity = Instant::now();
                     self.shm_ready.insert(tok);
                 }
             }
@@ -931,7 +910,6 @@ impl Dev {
         match (f, c.state) {
             (Frame::Bell, _) => {
                 if c.shm.is_some() {
-                    c.last_activity = Instant::now();
                     self.stats.bells_in += 1;
                     self.shm_ready.insert(tok);
                 }
@@ -996,9 +974,7 @@ impl Dev {
             let h2g = Ring::new(&(*ctl).h2g, t.rings[2 * i + 1]);
             ShmConn { slot, ctl, tx: Consumer::new(g2h), rx: Producer::new(h2g) }
         };
-        let c = self.conns.get_mut(&tok).unwrap();
-        c.shm = Some(sc);
-        c.last_activity = Instant::now();
+        self.conns.get_mut(&tok).unwrap().shm = Some(sc);
         true
     }
 
@@ -1008,12 +984,7 @@ impl Dev {
             if c.state != State::Relay {
                 continue;
             }
-            let before = self.stats.shm_tx_bytes + self.stats.shm_rx_bytes;
-            let result = c.pump_shm(&mut self.stats, arm);
-            if self.stats.shm_tx_bytes + self.stats.shm_rx_bytes != before {
-                c.last_activity = Instant::now();
-            }
-            match result {
+            match c.pump_shm(&mut self.stats, arm) {
                 Ok(bell) => {
                     // One pending byte is enough to wake the agent.
                     if bell && !c.guest_shut_rcv && c.prefix.is_empty() {
@@ -1346,7 +1317,6 @@ impl Dev {
             // Doorbells (or nothing at all): the payload is in the rings.
             c.fwd_cnt = c.fwd_cnt.wrapping_add(len as u32);
             if len > 0 && c.shm.is_some() {
-                c.last_activity = Instant::now();
                 self.stats.bells_in += 1;
                 self.shm_ready.insert(tok);
             }
@@ -1750,67 +1720,5 @@ mod tests {
         assert_eq!(stats.shm_tx_bytes, SHM_TX_BATCH as u64);
         assert_eq!(stats.shm_tx_writes, 1);
         assert_eq!(c.shm.as_ref().unwrap().tx.avail().unwrap(), 0);
-
-        let now = Instant::now();
-        let budget = Duration::from_micros(50);
-        c.last_activity = now - budget;
-        assert!(!c.poll_eligible(now, budget, true));
-        assert!(c.poll_eligible(now, budget, false));
-        c.last_activity = now;
-        assert!(c.poll_eligible(now, budget, true));
-        assert!(!c.poll_eligible(now, Duration::ZERO, false));
-        c.bulk = true;
-        assert!(!c.poll_eligible(now, budget, true));
-    }
-
-    #[test]
-    fn polling_yield_arms_idle_ring_before_sleep() {
-        let cfg = Config {
-            cid: 3,
-            aliases: Vec::new(),
-            listen_port: 1024,
-            guest_port: 1025,
-            forwards: Vec::new(),
-            busy_poll: Duration::from_micros(50),
-        };
-        let mut dev = Dev::new(&cfg, Arc::new(Vec::new())).unwrap();
-        let mem = GuestMemoryAtomic::new(GuestMemoryMmap::new());
-        dev.mem = Some(mem.clone());
-        let vrings: Vec<_> = (0..NUM_QUEUES).map(|_| VringRwLock::new(mem.clone(), 256).unwrap()).collect();
-
-        let ctl1: Box<SlotCtl> = Box::new(unsafe { std::mem::zeroed() });
-        let ctl2: Box<SlotCtl> = Box::new(unsafe { std::mem::zeroed() });
-        ctl1.claim();
-        ctl2.claim();
-        let mut a = vec![0u8; RING_SIZE];
-        let mut b = vec![0u8; RING_SIZE];
-        let mut c = vec![0u8; RING_SIZE];
-        let mut d = vec![0u8; RING_SIZE];
-        let a = unsafe { Ring::new(&ctl1.g2h, a.as_mut_ptr()) };
-        let b = unsafe { Ring::new(&ctl1.h2g, b.as_mut_ptr()) };
-        let c = unsafe { Ring::new(&ctl2.g2h, c.as_mut_ptr()) };
-        let d = unsafe { Ring::new(&ctl2.h2g, d.as_mut_ptr()) };
-        let mut guest = Producer::new(a);
-        let mut blocked_guest = Producer::new(c);
-        blocked_guest.commit(1);
-
-        let raw1 = unsafe { libc::memfd_create(c"netd-poll-test".as_ptr(), libc::MFD_CLOEXEC) };
-        let raw2 = unsafe { libc::memfd_create(c"netd-poll-test".as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(raw1 >= 0 && raw2 >= 0);
-        let mut idle = Conn::new(1, 2, State::Relay);
-        idle.sock = Some(unsafe { OwnedFd::from_raw_fd(raw1) });
-        idle.shm = Some(ShmConn { slot: 0, ctl: &*ctl1, tx: Consumer::new(a), rx: Producer::new(b) });
-        idle.writable = true;
-        idle.last_activity = Instant::now() - cfg.busy_poll;
-        let mut blocked = Conn::new(3, 4, State::Relay);
-        blocked.sock = Some(unsafe { OwnedFd::from_raw_fd(raw2) });
-        blocked.shm = Some(ShmConn { slot: 1, ctl: &*ctl2, tx: Consumer::new(c), rx: Producer::new(d) });
-        blocked.bulk = true;
-        dev.add_conn(idle);
-        dev.add_conn(blocked);
-        dev.polling = true;
-        dev.run(&vrings).unwrap();
-        assert!(!dev.polling);
-        assert!(guest.commit(1));
     }
 }
