@@ -11,6 +11,7 @@
 //! shared rings in guest hugepages (see `shm`) instead of the vsock stream.
 
 mod acceptor;
+mod inbox;
 mod pool;
 mod shm;
 

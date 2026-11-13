@@ -198,6 +198,11 @@ pub struct FrameReader {
 }
 
 impl FrameReader {
+    /// No partial frame is buffered.
+    pub fn at_boundary(&self) -> bool {
+        self.part.is_empty()
+    }
+
     /// Feeds `b`, calling `f` for every complete frame.
     pub fn feed(&mut self, mut b: &[u8], mut f: impl FnMut(Frame) -> io::Result<()>) -> io::Result<()> {
         while !b.is_empty() {
