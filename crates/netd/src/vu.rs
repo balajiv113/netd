@@ -457,6 +457,7 @@ struct Stats {
     bells_out: u64,
     epoll_events: u64,
     busy_polls: u64,
+    connect_immediate: u64,
 }
 
 impl Stats {
@@ -567,6 +568,20 @@ fn so_error(fd: RawFd) -> i32 {
         return errno();
     }
     e
+}
+
+fn connect_ready(fd: RawFd) -> io::Result<bool> {
+    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    loop {
+        let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if n >= 0 {
+            return Ok(n != 0);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
 }
 
 type Mem = GuestMemoryMmap;
@@ -846,6 +861,15 @@ impl Dev {
                     self.fail(tok, e.raw_os_error().unwrap_or(libc::EIO));
                 } else if !in_progress {
                     self.connected(tok);
+                } else {
+                    match connect_ready(raw) {
+                        Ok(true) => {
+                            self.stats.connect_immediate += 1;
+                            self.finish_connect(tok);
+                        }
+                        Ok(false) => {}
+                        Err(e) => self.fail(tok, e.raw_os_error().unwrap_or(libc::EIO)),
+                    }
                 }
             }
             Err(e) => self.fail(tok, e),
@@ -1721,6 +1745,41 @@ mod tests {
         assert_eq!(iov.iter().map(|v| v.iov_len).collect::<Vec<_>>(), vec![1, 3]);
         assert_eq!(&a, b"\0he");
         assert_eq!(&b[..3], b"llo");
+    }
+
+    #[test]
+    fn outbound_connect_completes_or_reports_refusal() {
+        let cfg = Config {
+            cid: 3,
+            aliases: Vec::new(),
+            listen_port: 1024,
+            guest_port: 1025,
+            forwards: Vec::new(),
+            busy_poll: Duration::ZERO,
+        };
+        let mut dev = Dev::new(&cfg, Arc::new(Vec::new())).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dst = listener.local_addr().unwrap();
+        let tok = dev.add_conn(Conn::new(1, 2, State::ReadReq));
+        dev.start_connect(tok, Request::tcp(dst, NO_SLOT));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dev.conns[&tok].state == State::Connecting && Instant::now() < deadline {
+            dev.poll_epoll();
+            std::thread::yield_now();
+        }
+        assert_eq!(dev.conns[&tok].state, State::Relay);
+        assert_eq!(proto::parse_status(dev.conns[&tok].prefix[..STATUS_LEN].try_into().unwrap()).0, 0);
+
+        assert_eq!(unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) }, 0);
+        let tok = dev.add_conn(Conn::new(3, 4, State::ReadReq));
+        dev.start_connect(tok, Request::tcp(dst, NO_SLOT));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dev.conns[&tok].state == State::Connecting && Instant::now() < deadline {
+            dev.poll_epoll();
+            std::thread::yield_now();
+        }
+        assert_eq!(dev.conns[&tok].state, State::Failed);
+        assert_eq!(proto::parse_status(dev.conns[&tok].prefix[..STATUS_LEN].try_into().unwrap()).0, libc::ECONNREFUSED);
     }
 
     #[test]
