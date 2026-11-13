@@ -7,3 +7,11 @@ license.workspace = true
 [dependencies]
 libc.workspace = true
 netd-common.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vhost = { version = "0.18", features = ["vhost-user-backend"] }
+vhost-user-backend = "0.24"
+virtio-bindings = "0.2.5"
+virtio-queue = "0.18"
+vm-memory = { version = "0.18", features = ["backend-mmap", "backend-atomic"] }
+vmm-sys-util = "0.15"

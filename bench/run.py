@@ -35,8 +35,8 @@ GUEST_IPERF_PORT = 5301
 NBENCH_PORT = 7000
 TAP = "nbtap0"
 
-ALL = ["native", "tap-vhost", "slirp", "gvproxy", "passt", "passt-vu", "netd-vu", "netd-kvsock"]
-NETD = ["netd-vu", "netd-kvsock"]
+ALL = ["native", "tap-vhost", "slirp", "gvproxy", "passt", "passt-vu", "netd", "netd-vu", "netd-kvsock"]
+NETD = ["netd", "netd-vu", "netd-kvsock"]
 BASELINE = Path(__file__).resolve().parent / "baseline" / "linux-kvm.json"
 
 
@@ -368,7 +368,22 @@ class NetdKvsock(NetdVU):
         return ["-device", "vhost-vsock-pci,guest-cid=3"]
 
 
-CLASSES = {c.name: c for c in [TapVhost, Slirp, Gvproxy, Passt, PasstVU, NetdVU, NetdKvsock]}
+class NetdEmbedded(NetdVU):
+    """netd is the vhost-user-vsock device itself (no vhost-device-vsock)."""
+    name = "netd"
+    mtu_note = "n/a (socket offload, netd embedded vhost-user-vsock, unprivileged)"
+
+    def start_backend(self):
+        (W / "netd-vu.sock").unlink(missing_ok=True)
+        self.spawn([BIN / "netd", "--vhost-user", f"{W}/netd-vu.sock", "--guest-cid", "3",
+                    "--forward", f"127.0.0.1:{FWD_HOST_PORT}={GUEST_IPERF_PORT}"], "netd")
+        wait_path(W / "netd-vu.sock")
+
+    def qemu_net(self):
+        return ["-chardev", f"socket,id=c1,path={W}/netd-vu.sock", "-device", "vhost-user-vsock-pci,chardev=c1"]
+
+
+CLASSES = {c.name: c for c in [TapVhost, Slirp, Gvproxy, Passt, PasstVU, NetdEmbedded, NetdVU, NetdKvsock]}
 
 
 def iperf_gbps(js):

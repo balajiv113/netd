@@ -2,11 +2,12 @@
 # Local pre-CI check: boots the Ubuntu 6.8 guest kernel under QEMU (TCG works, no KVM needed)
 # with netd-agent in an initramfs, and runs up/down iperf3 + rr through
 # vhost-device-vsock + netd.
-#   bench/vmtest/vmtest.sh [VHOST_DEVICE_VSOCK_BIN] [agent-args,comma,separated]
+#   bench/vmtest/vmtest.sh [embedded|VHOST_DEVICE_VSOCK_BIN] [agent-args,comma,separated]
+# "embedded" (default) runs netd itself as the vhost-user-vsock device.
 # Needs: qemu-system-x86_64, iperf3, cpio, zstd, curl, dpkg-deb.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-VDV=${1:-vhost-device-vsock}; EXTRA=${2:-}
+VDV=${1:-embedded}; EXTRA=${2:-}
 KVER=${KVER:-6.8.0-147}
 C=${VMTEST_CACHE:-$HOME/.cache/netd-vmtest}; W=$(mktemp -d)
 mkdir -p "$C"
@@ -24,7 +25,7 @@ cargo build --release -q --manifest-path "$ROOT/Cargo.toml"
 N=$ROOT/target/release
 R=$W/rootfs; mkdir -p $R/{bin,proc,sys,dev,tmp,mod}
 cp "$C/x/usr/bin/busybox" $R/bin/
-for b in sh mount insmod ip poweroff sleep cat echo kill cut grep tr; do ln -s busybox $R/bin/$b; done
+for b in sh mount insmod ip poweroff sleep cat echo kill cut grep tr timeout; do ln -s busybox $R/bin/$b; done
 cp $N/netd-agent $N/nbench "$(command -v iperf3)" $R/bin/
 for f in $N/netd-agent $N/nbench "$(command -v iperf3)"; do ldd "$f" | grep -o '/[^ ]*'; done | sort -u |
   while read -r l; do mkdir -p "$R$(dirname "$l")"; cp -L "$l" "$R$l"; done
@@ -36,14 +37,18 @@ mount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev
 for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do insmod /mod/$m.ko; done
 ip link set lo up
 EXTRA=$(grep -o 'agent=[^ ]*' /proc/cmdline | cut -d= -f2- | tr , ' ')
-netd-agent --fixed-dst 192.168.5.2:5201 --listen 127.0.0.1:15001 --inbound-vsock 0 $EXTRA 2>/tmp/agent.log & A=$!
+netd-agent --fixed-dst 192.168.5.2:5201 --listen 127.0.0.1:15001 $EXTRA 2>/tmp/agent.log &
 sleep 1
 echo "VMTEST: up";   iperf3 -c 127.0.0.1 -p 15001 -t 5 -O 1 --connect-timeout 5000 2>&1 | grep -E "receiver|error"
 echo "VMTEST: down"; iperf3 -c 127.0.0.1 -p 15001 -t 5 -O 1 -R --connect-timeout 5000 2>&1 | grep -E "receiver|error"
-kill $A
 netd-agent --fixed-dst 192.168.5.2:7000 --listen 127.0.0.1:15002 --inbound-vsock 0 $EXTRA 2>>/tmp/agent.log &
 sleep 1
 echo "VMTEST: rr $(nbench rr 127.0.0.1:15002 2000 2>&1)"
+echo "VMTEST: crr $(nbench crr 127.0.0.1:15002 3 2>&1)"
+iperf3 -s -1 -p 5301 >/dev/null 2>&1 & S=$!
+sleep 1
+echo "VMTEST: fwd-ready"
+timeout 60 sh -c "while kill -0 $S 2>/dev/null; do sleep 1; done"
 echo "VMTEST: agent log"; cat /tmp/agent.log
 echo "VMTEST: DONE"; poweroff -f
 EOF
@@ -55,16 +60,28 @@ cleanup() { kill "${PIDS[@]}" 2>/dev/null || true; }
 trap cleanup EXIT
 iperf3 -s -p 5201 >$W/iperf.log 2>&1 & PIDS+=($!)
 $N/nbench server 127.0.0.1:7000 >$W/nb.log 2>&1 & PIDS+=($!)
-RUST_LOG=${VDV_LOG:-warn} "$VDV" --vm guest-cid=3,socket=$W/vu.sock,uds-path=$W/vm.vsock,tx-buffer-size=1048576,queue-size=1024 >$W/vdv.log 2>&1 & PIDS+=($!)
-$N/netd --listen-uds $W/vm.vsock_1024 --guest-uds $W/vm.vsock >$W/netd.log 2>&1 & PIDS+=($!)
+if [ "$VDV" = embedded ]; then
+  $N/netd --vhost-user $W/vu.sock --guest-cid 3 --forward 127.0.0.1:15301=5301 >$W/netd.log 2>&1 & PIDS+=($!)
+else
+  RUST_LOG=${VDV_LOG:-warn} "$VDV" --vm guest-cid=3,socket=$W/vu.sock,uds-path=$W/vm.vsock,tx-buffer-size=1048576,queue-size=1024 >$W/vdv.log 2>&1 & PIDS+=($!)
+  $N/netd --listen-uds $W/vm.vsock_1024 --guest-uds $W/vm.vsock --forward 127.0.0.1:15301=5301 >$W/netd.log 2>&1 & PIDS+=($!)
+fi
 for _ in $(seq 50); do [ -S $W/vu.sock ] && break; sleep 0.1; done
 ACCEL=tcg; [ -w /dev/kvm ] && ACCEL=kvm
 timeout 300 qemu-system-x86_64 -machine q35 -accel $ACCEL -smp 2 -m 1024 -nodefaults -display none \
   -object memory-backend-memfd,id=mem,size=1024M,share=on -numa node,memdev=mem \
   -chardev socket,id=c1,path=$W/vu.sock -device vhost-user-vsock-pci,chardev=c1 \
   -kernel "$C/x/boot/vmlinuz-$KVER-generic" -initrd $W/initrd.gz \
-  -append "console=ttyS0 rdinit=/init quiet agent=$EXTRA" -serial stdio -no-reboot 2>&1 |
-  sed -n '/VMTEST: up/,/VMTEST: DONE/p' | grep -Ev '^\[ *[0-9]+\.[0-9]+\]' | tee $W/out.txt
+  -append "console=ttyS0 rdinit=/init quiet agent=$EXTRA" -serial file:$W/console.log -no-reboot & Q=$!
+for _ in $(seq 600); do grep -q 'VMTEST: fwd-ready' $W/console.log 2>/dev/null && break; kill -0 $Q 2>/dev/null || break; sleep 0.5; done
+if grep -q 'VMTEST: fwd-ready' $W/console.log; then
+  NETD_PID=$(pgrep -f "^$N/netd " | head -1)
+  [ -n "$NETD_PID" ] && echo "netd open fds after crr: $(ls /proc/$NETD_PID/fd | wc -l)" > $W/fds.txt
+  timeout 30 iperf3 -c 127.0.0.1 -p 15301 -t 5 -O 1 --connect-timeout 5000 2>&1 | grep -E "receiver|error" > $W/fwd.txt || true
+fi
+wait $Q || true
+{ sed -n '/VMTEST: up/,/VMTEST: DONE/p' $W/console.log | grep -Ev '^\[ *[0-9]+\.[0-9]+\]' | grep -v fwd-ready
+  echo "VMTEST: fwd (host -> guest)"; cat $W/fwd.txt 2>/dev/null; cat $W/fds.txt 2>/dev/null; } | tee $W/out.txt
 echo "logs: $W"
-# Fail if either direction moved no data.
-[ "$(grep -A1 -E 'VMTEST: (up|down)' $W/out.txt | grep -c ' [1-9][0-9.]* [MG]bits/sec')" -eq 2 ] && echo "VMTEST: PASS" || { echo "VMTEST: FAIL"; exit 1; }
+# Fail if any direction moved no data.
+grep -q "\"errors\":0" $W/out.txt && [ "$(grep -A1 -E 'VMTEST: (up|down|fwd)' $W/out.txt | grep -c ' [1-9][0-9.]* [MG]bits/sec')" -eq 3 ] && echo "VMTEST: PASS" || { echo "VMTEST: FAIL"; exit 1; }

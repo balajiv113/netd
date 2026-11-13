@@ -87,6 +87,12 @@ jobs:
           cargo build --release
           echo "VHOST_DEVICE_VSOCK=$HOME/.cargo/bin/vhost-device-vsock" >> "$GITHUB_ENV"
 
+      - name: Smoke test (netd vhost-user + vhost-device-vsock, minimal guest)
+        run: |
+          sudo apt-get install -y -q cpio zstd >/dev/null
+          bench/vmtest/vmtest.sh embedded
+          bench/vmtest/vmtest.sh "$HOME/.cargo/bin/vhost-device-vsock"
+
       - name: Cache cloud image
         uses: actions/cache@v4
         with:

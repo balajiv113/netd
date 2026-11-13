@@ -4,6 +4,12 @@
 //! hybrid Unix socket or the kernel vhost-vsock device), carry an offload
 //! request header and are turned into real host TCP connections. Host port
 //! forwards go the opposite way.
+//!
+//! With `--vhost-user` netd is itself the guest's vhost-user-vsock device and
+//! moves payload directly between guest memory and host sockets (see `vu`).
+
+#[cfg(target_os = "linux")]
+mod vu;
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -18,6 +24,9 @@ use netd_common::proto::{self, PROTO_TCP, Request};
 use netd_common::{relay, sock};
 
 const USAGE: &str = "usage: netd [options]
+  --vhost-user PATH        be the guest's vhost-user-vsock device on socket PATH (fastest;
+                           QEMU: -chardev socket,path=PATH -device vhost-user-vsock-pci)
+  --guest-cid CID          guest CID for --vhost-user (default 3)
   --listen-uds PATH        accept guest connections on a Unix socket (vhost-device-vsock: <uds-path>_<port>)
   --listen-vsock PORT      accept guest connections on AF_VSOCK (kernel vhost-vsock)
   --guest-uds PATH         reach the guest agent through vhost-device-vsock's <uds-path>
@@ -34,6 +43,8 @@ enum GuestPath {
 }
 
 struct Config {
+    vhost_user: Option<String>,
+    guest_cid: u64,
     listen_uds: Vec<String>,
     listen_vsock: Vec<u32>,
     guest: Option<GuestPath>,
@@ -54,6 +65,8 @@ fn parse<T: std::str::FromStr>(v: &str, what: &str) -> T {
 
 fn parse_args() -> Config {
     let mut c = Config {
+        vhost_user: None,
+        guest_cid: 3,
         listen_uds: vec![],
         listen_vsock: vec![],
         guest: None,
@@ -70,6 +83,8 @@ fn parse_args() -> Config {
         }
         let v = args.next().unwrap_or_else(|| die(&format!("{a} needs a value")));
         match a.as_str() {
+            "--vhost-user" => c.vhost_user = Some(v),
+            "--guest-cid" => c.guest_cid = parse(&v, "cid"),
             "--listen-uds" => c.listen_uds.push(v),
             "--listen-vsock" => c.listen_vsock.push(parse(&v, "port")),
             "--guest-uds" => c.guest = Some(GuestPath::Uds(v)),
@@ -87,6 +102,12 @@ fn parse_args() -> Config {
     if c.aliases.is_empty() {
         c.aliases = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 5, 2)), IpAddr::V6("fd00:5::2".parse().unwrap())];
     }
+    if c.vhost_user.is_some() {
+        if !c.listen_uds.is_empty() || !c.listen_vsock.is_empty() || c.guest.is_some() {
+            die("--vhost-user cannot be combined with --listen-*/--guest-uds/--guest-vsock");
+        }
+        return c;
+    }
     if c.listen_uds.is_empty() && c.listen_vsock.is_empty() && c.forwards.is_empty() {
         die("nothing to do");
     }
@@ -96,7 +117,7 @@ fn parse_args() -> Config {
     c
 }
 
-fn map_dst(aliases: &[IpAddr], dst: SocketAddr) -> SocketAddr {
+pub(crate) fn map_dst(aliases: &[IpAddr], dst: SocketAddr) -> SocketAddr {
     if aliases.contains(&dst.ip()) {
         let lo = match dst.ip() {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -183,8 +204,41 @@ fn spawn_acceptor(name: String, listener: OwnedFd, aliases: Arc<Vec<IpAddr>>, vs
     });
 }
 
+#[cfg(target_os = "linux")]
+fn run_vhost_user(path: &str, cfg: &Config) -> ! {
+    let forwards = cfg
+        .forwards
+        .iter()
+        .map(|&(addr, gport)| {
+            let l = TcpListener::bind(addr).unwrap_or_else(|e| {
+                eprintln!("netd: forward bind {addr}: {e}");
+                exit(1)
+            });
+            l.set_nonblocking(true).expect("nonblocking listener");
+            eprintln!("netd: forwarding {addr} -> guest port {gport}");
+            (l, gport)
+        })
+        .collect();
+    vu::serve(
+        path,
+        vu::Config {
+            cid: cfg.guest_cid,
+            aliases: cfg.aliases.clone(),
+            listen_port: 1024,
+            guest_port: cfg.guest_port,
+            forwards,
+        },
+    )
+}
+
 fn main() {
     let cfg = Arc::new(parse_args());
+    if let Some(path) = &cfg.vhost_user {
+        #[cfg(target_os = "linux")]
+        run_vhost_user(path, &cfg);
+        #[cfg(not(target_os = "linux"))]
+        die(&format!("--vhost-user {path} is only supported on Linux"));
+    }
     let aliases = Arc::new(cfg.aliases.clone());
 
     for path in &cfg.listen_uds {
