@@ -42,6 +42,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
           nproc; free -g; uname -r
+          lscpu | grep -E "Model name|Thread|Core|Socket|L3"
 
       - name: Install packages
         run: |
