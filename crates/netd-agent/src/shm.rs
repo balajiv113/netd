@@ -328,11 +328,7 @@ fn send(v: RawFd, f: Frame) -> io::Result<()> {
 pub fn relay_out(tcp: OwnedFd, slot: Slot, dst: SocketAddr) -> io::Result<()> {
     let v = slot.stream.as_raw_fd();
     let id = slot.region.next_id.fetch_add(1, Ordering::Relaxed);
-    send(v, Frame::Open { id, dst })?;
-    let res = pump(tcp, v, &slot, Some(id));
-    // Fails only if the stream is gone, and netd with it.
-    let _ = send(v, if res.is_ok() { Frame::Close } else { Frame::Reset });
-    res
+    pump(tcp, v, &slot, Some((id, dst)))
 }
 
 /// Relays a host port forward through the slot; `vs` is the connection's
@@ -342,25 +338,57 @@ pub fn relay_in(tcp: OwnedFd, vs: OwnedFd, slot: Slot) -> io::Result<()> {
     pump(tcp, vs.as_raw_fd(), &slot, None)
 }
 
-/// `id`: the connection on a slot stream, whose Fail frame ends the relay.
-fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, id: Option<u32>) -> io::Result<()> {
+/// `open`: the connection on a slot stream, whose Fail frame ends the relay.
+fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, open: Option<(u32, SocketAddr)>) -> io::Result<()> {
     let t = tcp.as_raw_fd();
-    set_nonblocking(t, true)?;
     let (mut tx, mut rx) = slot.rings();
     let mut cnt = Counters::default();
     let start = Instant::now();
-    let res = pump_loop(t, v, &mut tx, &mut rx, id, &mut cnt);
+    let initial = set_nonblocking(t, true).and_then(|()| {
+        if open.is_some() { read_initial(t, &mut tx, &mut cnt) } else { Ok(false) }
+    });
+    if let Some((id, dst)) = open {
+        // Even when the initial read failed, netd must see Open and Reset
+        // so it can release the claimed slot.
+        send(v, Frame::Open { id, dst })?;
+    }
+    let res = initial.and_then(|app_eof| pump_loop(t, v, &mut tx, &mut rx, open.map(|o| o.0), app_eof, &mut cnt));
+    if open.is_some() {
+        send(v, if res.is_ok() { Frame::Close } else { Frame::Reset })?;
+    }
     if std::env::var_os("NETD_STATS").is_some() && cnt.bytes_in + cnt.bytes_out > 1 << 20 {
         eprintln!("netd-agent: relay {:?} {cnt:?}", start.elapsed());
     }
     res
 }
 
-fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Option<u32>, cnt: &mut Counters) -> io::Result<()> {
+/// Publish any already queued data before Open wakes netd. Never wait here:
+/// server-first protocols must connect even when the application sent nothing.
+fn read_initial(t: RawFd, tx: &mut Producer, cnt: &mut Counters) -> io::Result<bool> {
+    let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+    let (k, n) = tx.free_iov(&mut iov, CHUNK)?;
+    if n == 0 {
+        return Ok(false);
+    }
+    match io_result(unsafe { libc::readv(t, iov.as_ptr(), k as i32) })? {
+        Io::Done(0) => {
+            tx.close();
+            Ok(true)
+        }
+        Io::Done(n) => {
+            cnt.reads += 1;
+            cnt.bytes_in += n as u64;
+            tx.commit(n);
+            Ok(false)
+        }
+        Io::Blocked => Ok(false),
+    }
+}
+
+fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Option<u32>, mut app_eof: bool, cnt: &mut Counters) -> io::Result<()> {
     let iov = &mut [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
     let mut scratch = [0u8; 256];
     let mut frames = FrameReader::default();
-    let mut app_eof = false;
     let mut wr_shut = false;
     loop {
         // Doorbells, and netd's verdict on this connection. Bells and Fail
@@ -523,4 +551,41 @@ fn spin(rx: &Consumer, ring_out: bool, t: RawFd, tev: libc::c_short) -> io::Resu
         unsafe { libc::sched_yield() };
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    use netd_common::shm::RING_SIZE;
+
+    #[test]
+    fn initial_read_handles_empty_data_and_half_close() {
+        // All SlotCtl fields are atomics, for which zero is a valid initial value.
+        let ctl: Box<SlotCtl> = Box::new(unsafe { std::mem::zeroed() });
+        ctl.claim();
+        let mut data = vec![0u8; RING_SIZE];
+        let ring = unsafe { Ring::new(&ctl.g2h, data.as_mut_ptr()) };
+        let mut tx = Producer::new(ring);
+        let mut rx = Consumer::new(ring);
+        let (mut app, agent) = UnixStream::pair().unwrap();
+        agent.set_nonblocking(true).unwrap();
+        let mut cnt = Counters::default();
+
+        assert!(!read_initial(agent.as_raw_fd(), &mut tx, &mut cnt).unwrap());
+        assert_eq!(rx.avail().unwrap(), 0);
+
+        app.write_all(b"request").unwrap();
+        assert!(!read_initial(agent.as_raw_fd(), &mut tx, &mut cnt).unwrap());
+        let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+        let (_, n) = rx.data_iov(&mut iov, CHUNK).unwrap();
+        assert_eq!(n, 7);
+        assert_eq!(unsafe { std::slice::from_raw_parts(iov[0].iov_base.cast::<u8>(), n) }, b"request");
+        rx.consume(n);
+
+        app.shutdown(Shutdown::Write).unwrap();
+        assert!(read_initial(agent.as_raw_fd(), &mut tx, &mut cnt).unwrap());
+        assert!(rx.finished().unwrap());
+    }
 }

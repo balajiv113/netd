@@ -48,7 +48,9 @@ vsock stream, opened when the rings are registered, and the slot's
 connections run over it one after another: the agent sends `Open{id, dst}`,
 starts relaying at once without waiting for an answer, and finishes with
 `Close` or `Reset`. netd only replies with `Fail{id, errno}` if the connect
-fails, and the agent then resets the guest connection. A connection therefore
+fails, and the agent then resets the guest connection. Already available
+application data is published before `Open`; the agent never waits for data,
+so server-first protocols also work. A connection therefore
 costs no vsock stream setup or teardown, only a few frames. When no slot is
 free (or shm is off) the agent falls back to its `--pool N` (default 4) of
 per-connection vsock streams.
