@@ -9,6 +9,7 @@
 //! moves payload directly between guest memory and host sockets (see `vu`).
 
 #[cfg(target_os = "linux")]
+mod pump;
 mod vu;
 
 use std::fs::File;
@@ -37,6 +38,8 @@ const USAGE: &str = "usage: netd [options]
   --host-alias IP          guest-visible address that maps to host loopback (repeatable;
                            default 192.168.5.2 and fd00:5::2)
   --vsock-buf BYTES        vsock credit window for AF_VSOCK sockets (default 4194304)
+  --workers N              with --vhost-user: threads moving shared-ring payload (default:
+                           CPU count, at most 4)
   --busy-poll-us US        with --vhost-user: keep polling active shared rings this long
                            before sleeping (default 50, 0 = event driven only)";
 
@@ -55,6 +58,7 @@ struct Config {
     forwards: Vec<(SocketAddr, u16)>,
     aliases: Vec<IpAddr>,
     vsock_buf: u64,
+    workers: usize,
     busy_poll_us: u64,
 }
 
@@ -78,6 +82,7 @@ fn parse_args() -> Config {
         forwards: vec![],
         aliases: vec![],
         vsock_buf: 4 << 20,
+        workers: std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
         busy_poll_us: 50,
     };
     let mut args = std::env::args().skip(1);
@@ -101,6 +106,7 @@ fn parse_args() -> Config {
             }
             "--host-alias" => c.aliases.push(parse(&v, "alias")),
             "--vsock-buf" => c.vsock_buf = parse(&v, "size"),
+            "--workers" => c.workers = parse(&v, "worker count"),
             "--busy-poll-us" => c.busy_poll_us = parse(&v, "microseconds"),
             _ => die(&format!("unknown option {a}")),
         }
@@ -236,6 +242,7 @@ fn run_vhost_user(path: &str, cfg: &Config) -> ! {
             listen_port: 1024,
             guest_port: cfg.guest_port,
             forwards,
+            workers: cfg.workers,
             busy_poll: std::time::Duration::from_micros(cfg.busy_poll_us),
         },
     )

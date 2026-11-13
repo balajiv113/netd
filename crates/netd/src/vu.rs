@@ -11,9 +11,9 @@
 //! and its per-packet copies. Everything runs on the backend's worker thread.
 //!
 //! When the agent has registered shared rings (netd_common::shm), connections
-//! that hold a slot bypass vsock packets entirely: netd moves payload between
-//! the host socket and the rings in guest memory, and the vsock stream only
-//! carries the handshake and one-byte doorbells.
+//! that hold a slot bypass vsock packets entirely: a pump worker (pump.rs)
+//! moves payload between the host socket and the rings in guest memory, and
+//! the vsock stream only carries the handshake and one-byte doorbells.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netd_common::proto::{self, Msg, PROTO_TCP, Request, STATUS_LEN, ShmRegion};
-use netd_common::shm::{CHUNK, Consumer, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
+use netd_common::shm::{NO_SLOT, RING_SIZE, SLOT_CTL};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringRwLock, VringState, VringT};
 use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
@@ -33,6 +33,8 @@ use virtio_queue::{QueueOwnedT, QueueT};
 use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend, GuestMemoryMmap};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::event::{EventConsumer, EventFlag, EventNotifier, new_event_consumer_and_notifier};
+
+use crate::pump::{self, Pool, Table};
 
 const NUM_QUEUES: usize = 3;
 const RXQ: usize = 0;
@@ -59,11 +61,8 @@ const BUF_ALLOC: u32 = 4 << 20;
 /// Upper bound of host->guest bytes moved by one readv.
 const RX_BATCH: usize = 1 << 20;
 const LISTENER_BIT: u64 = 1 << 63;
-/// epoll token of the eventfd the worker uses to reschedule itself.
-const YIELD_TOK: u64 = 0;
-/// Longest stretch the worker busy-polls before letting other users of the
-/// device lock (e.g. the vhost-user frontend thread) in.
-const MAX_POLL: Duration = Duration::from_millis(1);
+/// epoll token of the pump workers' event fd.
+const PUMP_TOK: u64 = 0;
 /// Host-side vsock ports for forwarded connections are allocated from here.
 const FIRST_HOST_PORT: u32 = 0x4000_0000;
 
@@ -76,8 +75,10 @@ pub struct Config {
     pub guest_port: u32,
     /// Non-blocking TCP listeners and the guest port each forwards to.
     pub forwards: Vec<(TcpListener, u16)>,
-    /// How long the worker keeps polling shared rings after the last work
-    /// before it sleeps (zero = event driven only).
+    /// Pump worker threads for shared-ring connections.
+    pub workers: usize,
+    /// How long a pump worker keeps polling a connection's rings after it
+    /// last moved data before it sleeps (zero = event driven only).
     pub busy_poll: Duration,
 }
 
@@ -199,23 +200,6 @@ enum State {
     Registration,
 }
 
-/// The agent's registered rings. The memory snapshot keeps the mappings
-/// alive; the pointers are validated against it at registration.
-struct ShmTable {
-    _mem: Arc<Mem>,
-    ctl: *mut u8,
-    rings: Vec<*mut u8>,
-    in_use: Vec<bool>,
-}
-
-/// A connection's rings: netd consumes guest->host and produces host->guest.
-struct ShmConn {
-    slot: u16,
-    ctl: *const SlotCtl,
-    tx: Consumer,
-    rx: Producer,
-}
-
 struct Conn {
     local_port: u32,
     peer_port: u32,
@@ -244,7 +228,9 @@ struct Conn {
     guest_shut_rcv: bool,
     /// Slot the agent asked for in its request.
     want_slot: u16,
-    shm: Option<ShmConn>,
+    /// Pump worker that owns the socket and the rings of a shared-ring
+    /// connection.
+    pump: Option<usize>,
 }
 
 impl Conn {
@@ -271,103 +257,13 @@ impl Conn {
             guest_shut_send: false,
             guest_shut_rcv: false,
             want_slot: NO_SLOT,
-            shm: None,
+            pump: None,
         }
     }
 
     fn peer_credit(&self) -> usize {
         let inflight = self.tx_cnt.wrapping_sub(self.peer_fwd_cnt);
         self.peer_buf_alloc.saturating_sub(inflight) as usize
-    }
-
-    /// Moves payload between the host socket and the shared rings until
-    /// both directions block. With `arm`, it then asks the agent for
-    /// doorbells where a ring is the obstacle. Returns true, possibly with
-    /// work left, as soon as the agent must be woken: the caller sends the
-    /// doorbell and pumps again, so both sides work on the ring at once.
-    fn pump_shm(&mut self, stats: &mut Stats, arm: bool) -> io::Result<bool> {
-        let Some(s) = self.shm.as_mut() else { return Ok(false) };
-        let fd = self.sock.as_ref().unwrap().as_raw_fd();
-        let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
-        loop {
-            while self.writable && !self.wr_shut {
-                let (k, n) = s.tx.data_iov(&mut iov, CHUNK)?;
-                if n == 0 {
-                    if s.tx.finished()? {
-                        unsafe { libc::shutdown(fd, libc::SHUT_WR) };
-                        self.wr_shut = true;
-                    }
-                    break;
-                }
-                let w = unsafe { libc::writev(fd, iov.as_ptr(), k as i32) };
-                if w < 0 {
-                    match errno() {
-                        libc::EINTR => continue,
-                        libc::EAGAIN => {
-                            stats.shm_tx_sock_full += 1;
-                            self.writable = false;
-                        }
-                        e => return Err(io::Error::from_raw_os_error(e)),
-                    }
-                    break;
-                }
-                stats.shm_tx_bytes += w as u64;
-                stats.shm_tx_writes += 1;
-                if (w as usize) < n {
-                    stats.shm_tx_sock_full += 1;
-                    self.writable = false;
-                }
-                if s.tx.consume(w as usize) {
-                    return Ok(true);
-                }
-            }
-            while self.readable && !self.sock_eof && !self.guest_shut_rcv {
-                let (k, n) = s.rx.free_iov(&mut iov, CHUNK)?;
-                if n == 0 {
-                    stats.shm_rx_ring_full += 1;
-                    break;
-                }
-                let r = unsafe { libc::readv(fd, iov.as_ptr(), k as i32) };
-                if r < 0 {
-                    match errno() {
-                        libc::EINTR => continue,
-                        libc::EAGAIN => self.readable = false,
-                        e => return Err(io::Error::from_raw_os_error(e)),
-                    }
-                    break;
-                }
-                if r == 0 {
-                    self.sock_eof = true;
-                    if s.rx.close() {
-                        return Ok(true);
-                    }
-                    break;
-                }
-                stats.shm_rx_bytes += r as u64;
-                stats.shm_rx_reads += 1;
-                if (r as usize) < n {
-                    self.readable = false;
-                }
-                if s.rx.commit(r as usize) {
-                    return Ok(true);
-                }
-            }
-            if !arm {
-                return Ok(false);
-            }
-            // Out of ring data (or space) with the socket still ready: ask the
-            // agent for a doorbell, unless it raced us and there is work again.
-            let mut again = false;
-            if self.writable && !self.wr_shut && !s.tx.wait()? {
-                again = true;
-            }
-            if self.readable && !self.sock_eof && !self.guest_shut_rcv && !s.rx.wait()? {
-                again = true;
-            }
-            if !again {
-                return Ok(false);
-            }
-        }
     }
 }
 
@@ -403,25 +299,9 @@ struct Stats {
     credit_updates: u64,
     tx_irqs: u64,
     rx_irqs: u64,
-    shm_tx_bytes: u64,
-    shm_rx_bytes: u64,
-    /// writev calls to host sockets, and how often one ended short or EAGAIN.
-    shm_tx_writes: u64,
-    shm_tx_sock_full: u64,
-    /// readv calls from host sockets, and how often the ring had no room.
-    shm_rx_reads: u64,
-    shm_rx_ring_full: u64,
     bells_in: u64,
     bells_out: u64,
     epoll_events: u64,
-    busy_polls: u64,
-}
-
-impl Stats {
-    /// Changes whenever a processing pass did something.
-    fn work(&self) -> u64 {
-        self.tx_pkts + self.rx_chains + self.shm_tx_bytes + self.shm_rx_bytes + self.epoll_events + self.bells_out
-    }
 }
 
 struct Dev {
@@ -442,10 +322,8 @@ struct Dev {
     ctl: VecDeque<Ctl>,
     rx_ready: HashSet<u64>,
     tx_ready: HashSet<u64>,
-    shm_ready: HashSet<u64>,
-    shm: Option<ShmTable>,
-    busy_poll: Duration,
-    yield_fd: OwnedFd,
+    shm: Option<Arc<Table>>,
+    pumps: Pool,
     segs: Vec<Seg>,
     iov: Vec<libc::iovec>,
 }
@@ -581,12 +459,8 @@ impl Dev {
         for (i, (l, _)) in forwards.iter().enumerate() {
             epoll_add(ep, l.as_raw_fd(), libc::EPOLLIN as u32, LISTENER_BIT | i as u64)?;
         }
-        let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if efd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let yield_fd = unsafe { OwnedFd::from_raw_fd(efd) };
-        epoll_add(ep, efd, libc::EPOLLIN as u32, YIELD_TOK)?;
+        let pumps = Pool::new(cfg.workers, cfg.busy_poll)?;
+        epoll_add(ep, pumps.event_fd(), libc::EPOLLIN as u32, PUMP_TOK)?;
         Ok(Dev {
             stats: Stats::default(),
             stats_at: std::env::var_os("NETD_STATS").map(|_| Instant::now()),
@@ -605,10 +479,8 @@ impl Dev {
             ctl: VecDeque::new(),
             rx_ready: HashSet::new(),
             tx_ready: HashSet::new(),
-            shm_ready: HashSet::new(),
             shm: None,
-            busy_poll: cfg.busy_poll,
-            yield_fd,
+            pumps,
             segs: Vec::with_capacity(512),
             iov: Vec::with_capacity(512),
         })
@@ -619,54 +491,12 @@ impl Dev {
         let guard = atomic.memory();
         let mem: &Mem = &guard;
         self.stats.wakeups += 1;
-        let start = Instant::now();
-        let mut last_work = start;
-        loop {
-            let before = self.stats.work();
-            self.poll_epoll();
-            self.process_tx(&vrings[TXQ], mem)?;
-            self.flush_tx_ready();
-            // While busy-polling, the rings are serviced without arming their
-            // wait flags, so the agent has no reason to ring the doorbell.
-            let busy = !self.busy_poll.is_zero() && self.conns.values().any(|c| c.shm.is_some());
-            let toks: Vec<u64> = if busy { self.shm_conns() } else { self.shm_ready.iter().copied().collect() };
-            self.shm_ready.clear();
-            self.pump_shm(toks, !busy);
-            self.process_rx(&vrings[RXQ], mem)?;
-            if !busy {
-                if self.shm_ready.is_empty() {
-                    break;
-                }
-                continue;
-            }
-            self.stats.busy_polls += 1;
-            if self.stats.work() != before {
-                last_work = Instant::now();
-            }
-            if start.elapsed() >= MAX_POLL {
-                // Still busy: come back through the event loop.
-                unsafe { libc::eventfd_write(self.yield_fd.as_raw_fd(), 1) };
-                break;
-            }
-            if last_work.elapsed() >= self.busy_poll {
-                // Idle: arm the rings and sleep, unless arming found work.
-                let before = self.stats.work();
-                let toks = self.shm_conns();
-                self.pump_shm(toks, true);
-                self.process_rx(&vrings[RXQ], mem)?;
-                if self.stats.work() == before {
-                    break;
-                }
-                last_work = Instant::now();
-            }
-            std::hint::spin_loop();
-        }
+        self.poll_epoll();
+        self.process_tx(&vrings[TXQ], mem)?;
+        self.flush_tx_ready();
+        self.process_rx(&vrings[RXQ], mem)?;
         self.print_stats();
         Ok(())
-    }
-
-    fn shm_conns(&self) -> Vec<u64> {
-        self.conns.iter().filter(|(_, c)| c.shm.is_some()).map(|(&t, _)| t).collect()
     }
 
     fn print_stats(&mut self) {
@@ -674,8 +504,13 @@ impl Dev {
         if at.elapsed().as_secs() < 1 {
             return;
         }
+        let (tx, rx, polls, wakeups) = self.pumps.stats.take();
         if self.stats.wakeups > 1 {
-            eprintln!("netd: stats {:?} conns={}", self.stats, self.conns.len());
+            eprintln!(
+                "netd: stats {:?} shm_tx_bytes: {tx}, shm_rx_bytes: {rx}, pump_busy_polls: {polls}, pump_wakeups: {wakeups}, conns={}",
+                self.stats,
+                self.conns.len()
+            );
         }
         self.stats = Stats::default();
         self.stats_at = Some(Instant::now());
@@ -693,9 +528,8 @@ impl Dev {
             self.stats.epoll_events += n as u64;
             for e in &evs[..n as usize] {
                 let (ev, tok) = (e.events, e.u64);
-                if tok == YIELD_TOK {
-                    let mut v = 0;
-                    unsafe { libc::eventfd_read(self.yield_fd.as_raw_fd(), &mut v) };
+                if tok == PUMP_TOK {
+                    self.pump_events();
                     continue;
                 }
                 if tok & LISTENER_BIT != 0 {
@@ -710,18 +544,11 @@ impl Dev {
                 }
                 if ev & (libc::EPOLLIN as u32 | libc::EPOLLRDHUP as u32 | hup) != 0 {
                     c.readable = true;
-                    if c.shm.is_none() {
-                        self.rx_ready.insert(tok);
-                    }
+                    self.rx_ready.insert(tok);
                 }
                 if ev & (libc::EPOLLOUT as u32 | hup) != 0 {
                     c.writable = true;
-                    if c.shm.is_none() {
-                        self.tx_ready.insert(tok);
-                    }
-                }
-                if c.shm.is_some() {
-                    self.shm_ready.insert(tok);
+                    self.tx_ready.insert(tok);
                 }
             }
             if (n as usize) < evs.len() {
@@ -807,7 +634,7 @@ impl Dev {
 
     fn connected(&mut self, tok: u64) {
         let want = self.conns[&tok].want_slot;
-        let slot = if self.attach_slot(tok, want) { want } else { NO_SLOT };
+        let slot = if self.hand_over(tok, want) { want } else { NO_SLOT };
         let c = self.conns.get_mut(&tok).unwrap();
         c.state = State::Relay;
         c.prefix.extend_from_slice(&proto::encode_status(0, slot));
@@ -815,7 +642,6 @@ impl Dev {
         c.readable = true;
         self.rx_ready.insert(tok);
         self.tx_ready.insert(tok);
-        self.shm_ready.insert(tok);
     }
 
     /// Registers the agent's rings, replacing (and resetting the connections
@@ -832,55 +658,44 @@ impl Dev {
         };
         let ctl = map(r.ctl_gpa, r.slots() * SLOT_CTL)?;
         let rings = r.ring_gpas.iter().map(|&g| map(g, RING_SIZE)).collect::<Result<Vec<_>, _>>()?;
-        let old: Vec<u64> = self.conns.iter().filter(|(_, c)| c.shm.is_some()).map(|(&t, _)| t).collect();
+        let old: Vec<u64> = self.conns.iter().filter(|(_, c)| c.pump.is_some()).map(|(&t, _)| t).collect();
         for tok in old {
             self.reset(tok);
         }
-        self.shm = Some(ShmTable { _mem: guard.into_inner(), ctl, rings, in_use: vec![false; r.slots()] });
+        self.shm = Some(Arc::new(Table::new(guard.into_inner(), ctl, rings)));
         eprintln!("netd: shared rings registered ({} slots)", r.slots());
         Ok(())
     }
 
-    /// Binds `slot` of the registered rings to the connection.
-    fn attach_slot(&mut self, tok: u64, slot: u16) -> bool {
-        let Some(t) = self.shm.as_mut() else { return false };
-        let i = slot as usize;
-        if slot == NO_SLOT || i >= t.in_use.len() || t.in_use[i] {
-            return false;
-        }
-        t.in_use[i] = true;
-        // SAFETY: the control block and both rings were mapped and checked at
-        // registration and stay mapped while the table holds the memory.
-        let sc = unsafe {
-            let ctl = t.ctl.add(i * SLOT_CTL) as *const SlotCtl;
-            let g2h = Ring::new(&(*ctl).g2h, t.rings[2 * i]);
-            let h2g = Ring::new(&(*ctl).h2g, t.rings[2 * i + 1]);
-            ShmConn { slot, ctl, tx: Consumer::new(g2h), rx: Producer::new(h2g) }
-        };
-        self.conns.get_mut(&tok).unwrap().shm = Some(sc);
+    /// Binds `slot` of the registered rings to the connected socket and hands
+    /// both to a pump worker. Returns false if the slot is not available.
+    fn hand_over(&mut self, tok: u64, slot: u16) -> bool {
+        let Some(rings) = self.shm.as_ref().and_then(|t| t.attach(slot)) else { return false };
+        let c = self.conns.get_mut(&tok).unwrap();
+        let sock = c.sock.take().unwrap();
+        unsafe { libc::epoll_ctl(self.epoll.as_raw_fd(), libc::EPOLL_CTL_DEL, sock.as_raw_fd(), std::ptr::null_mut()) };
+        c.pump = Some(self.pumps.add(tok, sock, rings));
         true
     }
 
-    fn pump_shm(&mut self, toks: Vec<u64>, arm: bool) {
-        for tok in toks {
-            let Some(c) = self.conns.get_mut(&tok) else { continue };
-            if c.state != State::Relay {
-                continue;
-            }
-            match c.pump_shm(&mut self.stats, arm) {
-                Ok(bell) => {
+    fn pump_events(&mut self) {
+        for e in self.pumps.events() {
+            match e {
+                pump::Event::Bell(tok) => {
+                    let Some(c) = self.conns.get_mut(&tok) else { continue };
                     // One pending byte is enough to wake the agent.
-                    if bell && !c.guest_shut_rcv && c.prefix.is_empty() {
+                    if !c.guest_shut_rcv && c.prefix.is_empty() {
                         c.prefix.push(0);
                         self.stats.bells_out += 1;
                         self.rx_ready.insert(tok);
                     }
-                    if bell {
-                        self.shm_ready.insert(tok);
-                    }
-                    self.check_done(tok);
                 }
-                Err(_) => self.reset(tok),
+                pump::Event::Reset(tok) => {
+                    if let Some(c) = self.conns.get_mut(&tok) {
+                        c.pump = None;
+                        self.reset(tok);
+                    }
+                }
             }
         }
     }
@@ -898,15 +713,12 @@ impl Dev {
     fn remove(&mut self, tok: u64) {
         if let Some(c) = self.conns.remove(&tok) {
             self.ports.remove(&(c.local_port, c.peer_port));
-            if let (Some(s), Some(t)) = (c.shm, self.shm.as_mut()) {
-                t.in_use[s.slot as usize] = false;
-                // SAFETY: mapped while the table lives; this is netd's last access.
-                unsafe { (*s.ctl).release() };
+            if let Some(w) = c.pump {
+                self.pumps.drop_stream(w, tok);
             }
         }
         self.rx_ready.remove(&tok);
         self.tx_ready.remove(&tok);
-        self.shm_ready.remove(&tok);
     }
 
     fn reset(&mut self, tok: u64) {
@@ -932,10 +744,13 @@ impl Dev {
     /// Closes connections whose both directions are finished.
     fn check_done(&mut self, tok: u64) {
         let Some(c) = self.conns.get_mut(&tok) else { return };
-        if let Some(s) = &c.shm {
+        if let Some(w) = c.pump {
             // EOF travels in the rings; the agent closes its vsock end when it
-            // is done, possibly leaving payload in the ring for netd to flush.
-            if c.guest_shut_send && c.guest_shut_rcv && (c.wr_shut || !matches!(s.tx.avail(), Ok(n) if n > 0)) {
+            // is done, possibly leaving payload in the ring for the worker to
+            // flush.
+            if c.guest_shut_send && c.guest_shut_rcv {
+                c.pump = None;
+                self.pumps.close(w, tok);
                 self.reset(tok);
             }
             return;
@@ -1080,9 +895,6 @@ impl Dev {
             OP_SHUTDOWN => {
                 c.guest_shut_send |= h.flags & SHUT_SEND != 0;
                 c.guest_shut_rcv |= h.flags & SHUT_RCV != 0;
-                if c.shm.is_some() {
-                    self.shm_ready.insert(tok);
-                }
                 self.check_done(tok);
             }
             OP_RST => self.remove(tok),
@@ -1129,7 +941,7 @@ impl Dev {
             } else {
                 let (st, slot) = proto::parse_status(c.hs[..STATUS_LEN].try_into().unwrap());
                 c.hs.clear();
-                if st != 0 || (slot != NO_SLOT && !self.attach_slot(tok, slot)) {
+                if st != 0 || (slot != NO_SLOT && !self.hand_over(tok, slot)) {
                     self.reset(tok);
                     return;
                 }
@@ -1137,17 +949,16 @@ impl Dev {
                 c.state = State::Relay;
                 c.readable = true;
                 c.writable = true;
-                self.shm_ready.insert(tok);
             }
             break;
         }
         let Some(c) = self.conns.get_mut(&tok) else { return };
-        if c.shm.is_some() || c.state == State::Registration {
+        if c.pump.is_some() || c.state == State::Registration {
             // Doorbells (or nothing at all): the payload is in the rings.
             c.fwd_cnt = c.fwd_cnt.wrapping_add(len as u32);
-            if len > 0 && c.shm.is_some() {
+            if let (true, Some(w)) = (len > 0, c.pump) {
                 self.stats.bells_in += 1;
-                self.shm_ready.insert(tok);
+                self.pumps.kick(w, tok);
             }
             self.maybe_credit(tok);
             return;
@@ -1319,7 +1130,7 @@ impl Dev {
             c.last_fwd_sent = c.fwd_cnt;
             return Rx::Sent;
         }
-        if c.state != State::Relay || c.shm.is_some() || !c.readable || c.sock_eof || c.guest_shut_rcv || credit == 0 {
+        if c.state != State::Relay || c.pump.is_some() || !c.readable || c.sock_eof || c.guest_shut_rcv || credit == 0 {
             return Rx::Idle;
         }
         let fd = c.sock.as_ref().unwrap().as_raw_fd();
@@ -1457,9 +1268,9 @@ impl VhostUserBackend for Backend {
 /// Serves the vhost-user socket forever; a new device is created for every
 /// frontend (QEMU) connection.
 pub fn serve(socket: &str, cfg: Config) -> ! {
-    let Config { cid, aliases, listen_port, guest_port, forwards, busy_poll } = cfg;
+    let Config { cid, aliases, listen_port, guest_port, forwards, workers, busy_poll } = cfg;
     let forwards = Arc::new(forwards);
-    let cfg = Config { cid, aliases, listen_port, guest_port, forwards: Vec::new(), busy_poll };
+    let cfg = Config { cid, aliases, listen_port, guest_port, forwards: Vec::new(), workers, busy_poll };
     loop {
         if let Err(e) = serve_once(socket, &cfg, forwards.clone()) {
             eprintln!("netd: vhost-user: {e}");

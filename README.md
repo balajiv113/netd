@@ -34,9 +34,14 @@ position, so a misbehaving guest can only corrupt its own connections.
 Connections without a free slot fall back to payload over vsock.
 
 Doorbells cost a guest kernel round trip, a VM exit and an interrupt, so both
-sides poll briefly before arming them: netd's worker keeps servicing active
-rings for `--busy-poll-us` (default 50) after the last work, like vhost-net's
+sides poll briefly before arming them: netd keeps servicing each stream's
+rings for `--busy-poll-us` (default 50) after its last work, like vhost-net's
 busyloop, and the agent spins for `--spin-us` (default 50) before sleeping.
+
+The ring data plane runs on `--workers N` pump threads (default: CPU count,
+at most 4), separate from the vhost-user virtqueue thread. Once a connection
+gets a slot, its host socket is handed to a worker (round robin), and the
+virtqueue thread only relays its doorbells and shutdowns.
 
 Connection setup avoids round trips too: the agent keeps `--pool N`
 (default 4) vsock streams to netd open, and once it has offered a ring slot it
