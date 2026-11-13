@@ -43,11 +43,15 @@ ring, rather than taking CPU from the peer that has to make room. Payload
 moves in 256 KiB chunks, each published as soon as it is copied, so both
 sides copy at the same time.
 
-Connection setup avoids round trips too: the agent keeps `--pool N`
-(default 4) vsock streams to netd open, and once it has offered a ring slot it
-starts relaying without waiting for netd's answer. The guest application is
-already connected to the agent anyway; if netd's status reports a failure, the
-agent resets the guest connection.
+Connection setup avoids round trips too. Each ring slot has one persistent
+vsock stream, opened when the rings are registered, and the slot's
+connections run over it one after another: the agent sends `Open{id, dst}`,
+starts relaying at once without waiting for an answer, and finishes with
+`Close` or `Reset`. netd only replies with `Fail{id, errno}` if the connect
+fails, and the agent then resets the guest connection. A connection therefore
+costs no vsock stream setup or teardown, only a few frames. When no slot is
+free (or shm is off) the agent falls back to its `--pool N` (default 4) of
+per-connection vsock streams.
 
 ## Crates
 

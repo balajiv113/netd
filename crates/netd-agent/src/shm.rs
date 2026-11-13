@@ -8,11 +8,12 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use netd_common::proto::{self, STATUS_LEN, ShmRegion};
+use netd_common::proto::{self, Frame, FrameReader, ShmRegion};
 use netd_common::shm::{CHUNK, Consumer, HUGEPAGE, NO_SLOT, Producer, Ring, SLOT_CTL, SlotCtl};
 
 static SPIN_US: AtomicU64 = AtomicU64::new(50);
@@ -48,6 +49,9 @@ pub struct Region {
     /// loses a registration, so slots claimed under an older one are free on
     /// its side.
     generation: AtomicU64,
+    /// Each slot's stream to netd (see proto::Frame), for the current registration.
+    streams: Mutex<Vec<Arc<OwnedFd>>>,
+    next_id: AtomicU32,
 }
 
 // SAFETY: the hugepage mapping is never unmapped; slot ownership is tracked
@@ -122,6 +126,8 @@ impl Region {
             used: Mutex::new(vec![false; slots]),
             live: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            streams: Mutex::new(Vec::new()),
+            next_id: AtomicU32::new(0),
         })
     }
 
@@ -135,11 +141,17 @@ impl Region {
         if !self.live.load(Ordering::Acquire) {
             return None;
         }
+        let streams = self.streams.lock().unwrap();
         let mut used = self.used.lock().unwrap();
-        let i = (0..used.len()).find(|&i| !used[i] && !self.ctl(i).host_busy())?;
+        let i = (0..streams.len()).find(|&i| !used[i] && !self.ctl(i).host_busy())?;
         used[i] = true;
         self.ctl(i).claim();
-        Some(Slot { region: self.clone(), idx: i, generation: self.generation.load(Ordering::Acquire) })
+        Some(Slot {
+            region: self.clone(),
+            idx: i,
+            generation: self.generation.load(Ordering::Acquire),
+            stream: streams[i].clone(),
+        })
     }
 
     /// Registers with netd and keeps the registration stream open; re-registers
@@ -175,6 +187,18 @@ impl Region {
             (0, _) => {}
             (e, _) => return Err(io::Error::from_raw_os_error(e)),
         }
+        let n = self.used.lock().unwrap().len();
+        let mut streams = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut f = File::from(connect()?);
+            f.write_all(&proto::encode_slot(i as u16))?;
+            match proto::read_status(&mut f)? {
+                (0, _) => {}
+                (e, _) => return Err(io::Error::from_raw_os_error(e)),
+            }
+            set_nonblocking(f.as_raw_fd(), true)?;
+            streams.push(Arc::new(OwnedFd::from(f)));
+        }
         // A new registration starts clean on netd's side: slots that only
         // netd still held (before it restarted) are free again.
         {
@@ -186,13 +210,21 @@ impl Region {
             }
         }
         self.generation.fetch_add(1, Ordering::AcqRel);
+        *self.streams.lock().unwrap() = streams;
         self.live.store(true, Ordering::Release);
         eprintln!("netd-agent: shared rings registered ({} slots)", self.msg.ring_gpas.len() / 2);
         done(first);
         // netd never sends on this stream; it ends when netd drops it.
         let mut b = [0u8; 64];
-        while s.read(&mut b)? > 0 {}
-        Ok(())
+        let res = loop {
+            match s.read(&mut b) {
+                Ok(0) => break Ok(()),
+                Ok(_) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        self.streams.lock().unwrap().clear();
+        res
     }
 }
 
@@ -205,16 +237,12 @@ pub struct Slot {
     region: Arc<Region>,
     idx: usize,
     generation: u64,
+    stream: Arc<OwnedFd>,
 }
 
 impl Slot {
     pub fn index(&self) -> u16 {
         self.idx as u16
-    }
-
-    /// netd did not take the slot.
-    pub fn give_back(self) {
-        self.region.ctl(self.idx).release();
     }
 
     /// (guest->host producer, host->guest consumer)
@@ -276,100 +304,83 @@ fn io_result(n: isize) -> io::Result<Io> {
     }
 }
 
-/// netd's answer to a request whose relay started before it arrived.
-struct Status {
-    want: Option<u16>,
-    buf: [u8; STATUS_LEN],
-    len: usize,
+/// Writes a whole frame to a non-blocking stream.
+fn send(v: RawFd, f: Frame) -> io::Result<()> {
+    let mut b = Vec::with_capacity(32);
+    f.encode(&mut b);
+    let mut off = 0;
+    while off < b.len() {
+        match io_result(unsafe { libc::write(v, b[off..].as_ptr().cast(), b.len() - off) })? {
+            Io::Done(n) => off += n,
+            Io::Blocked => {
+                let mut p = libc::pollfd { fd: v, events: libc::POLLOUT, revents: 0 };
+                unsafe { libc::poll(&mut p, 1, -1) };
+            }
+        }
+    }
+    Ok(())
 }
 
-impl Status {
-    fn pending(&self) -> bool {
-        self.len < STATUS_LEN
-    }
-
-    fn unread(&mut self) -> &mut [u8] {
-        &mut self.buf[self.len..]
-    }
-
-    /// Records `n` bytes read into `unread()`; fails on a negative answer.
-    fn got(&mut self, n: usize) -> io::Result<()> {
-        self.len += n;
-        match self.want {
-            Some(want) if !self.pending() => match proto::parse_status(&self.buf) {
-                (0, slot) if slot == want => Ok(()),
-                (0, _) => Err(io::Error::other("netd did not attach the shared ring")),
-                (errno, _) => Err(io::Error::from_raw_os_error(errno)),
-            },
-            _ => Ok(()),
-        }
-    }
-
-    /// Whether netd took the slot, making it responsible for releasing it.
-    fn attached(&self) -> bool {
-        match self.want {
-            None => true,
-            Some(want) => !self.pending() && proto::parse_status(&self.buf) == (0, want),
-        }
-    }
-}
-
-/// Relays a guest TCP connection through a slot's rings. `vs` is the
-/// connection's vsock stream, used only for doorbells from here on.
-/// `status`: if netd has not answered the request yet, the slot its status
-/// (which then precedes the doorbells on `vs`) is expected to confirm.
-pub fn relay(tcp: OwnedFd, vs: OwnedFd, slot: Slot, status: Option<u16>) -> io::Result<()> {
-    let mut st = Status { want: status, buf: [0; STATUS_LEN], len: if status.is_some() { 0 } else { STATUS_LEN } };
-    let res = pump(tcp, vs.as_raw_fd(), &slot, &mut st);
-    if st.pending() {
-        // Find out who frees the slot; netd always answers or resets.
-        let mut f = File::from(vs);
-        if set_nonblocking(f.as_raw_fd(), false).is_ok() && f.read_exact(st.unread()).is_ok() {
-            st.len = STATUS_LEN;
-        }
-    }
-    if !st.attached() {
-        slot.give_back();
-    }
+/// Relays an outbound guest TCP connection to `dst` through the slot. The
+/// application is already connected (to us), so nothing waits for netd:
+/// payload goes into the ring while netd connects, and a Fail frame resets
+/// the connection if netd could not.
+pub fn relay_out(tcp: OwnedFd, slot: Slot, dst: SocketAddr) -> io::Result<()> {
+    let v = slot.stream.as_raw_fd();
+    let id = slot.region.next_id.fetch_add(1, Ordering::Relaxed);
+    send(v, Frame::Open { id, dst })?;
+    let res = pump(tcp, v, &slot, Some(id));
+    // Fails only if the stream is gone, and netd with it.
+    let _ = send(v, if res.is_ok() { Frame::Close } else { Frame::Reset });
     res
 }
 
-fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, st: &mut Status) -> io::Result<()> {
+/// Relays a host port forward through the slot; `vs` is the connection's
+/// own stream, used only for doorbells, and closing it ends the connection.
+pub fn relay_in(tcp: OwnedFd, vs: OwnedFd, slot: Slot) -> io::Result<()> {
+    set_nonblocking(vs.as_raw_fd(), true)?;
+    pump(tcp, vs.as_raw_fd(), &slot, None)
+}
+
+/// `id`: the connection on a slot stream, whose Fail frame ends the relay.
+fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, id: Option<u32>) -> io::Result<()> {
     let t = tcp.as_raw_fd();
     set_nonblocking(t, true)?;
-    set_nonblocking(v, true)?;
     let (mut tx, mut rx) = slot.rings();
     let mut cnt = Counters::default();
     let start = Instant::now();
-    let res = pump_loop(t, v, &mut tx, &mut rx, st, &mut cnt);
+    let res = pump_loop(t, v, &mut tx, &mut rx, id, &mut cnt);
     if std::env::var_os("NETD_STATS").is_some() && cnt.bytes_in + cnt.bytes_out > 1 << 20 {
         eprintln!("netd-agent: relay {:?} {cnt:?}", start.elapsed());
     }
     res
 }
 
-fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, st: &mut Status, cnt: &mut Counters) -> io::Result<()> {
+fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Option<u32>, cnt: &mut Counters) -> io::Result<()> {
     let iov = &mut [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
     let mut scratch = [0u8; 256];
+    let mut frames = FrameReader::default();
     let mut app_eof = false;
     let mut wr_shut = false;
     loop {
-        // Status, then doorbells. netd keeps the stream open until the agent
-        // is done, so EOF or an error here means the connection was reset.
+        // Doorbells, and netd's verdict on this connection. Bells and Fail
+        // frames left over from the slot's earlier connections are ignored.
+        // netd keeps the stream open while the agent uses it, so EOF here
+        // means it went away.
         loop {
-            let buf = if st.pending() { st.unread() } else { &mut scratch[..] };
-            match unsafe { libc::read(v, buf.as_mut_ptr().cast(), buf.len()) } {
-                0 => return Err(io::ErrorKind::ConnectionReset.into()),
-                n if n > 0 && st.pending() => st.got(n as usize)?,
-                n if n > 0 => continue,
-                n => match io_result(n)? {
-                    Io::Blocked => break,
-                    Io::Done(_) => unreachable!(),
-                },
+            match io_result(unsafe { libc::read(v, scratch.as_mut_ptr().cast(), scratch.len()) })? {
+                Io::Done(0) => return Err(io::ErrorKind::ConnectionReset.into()),
+                Io::Done(n) => frames.feed(&scratch[..n], |f| match f {
+                    Frame::Fail { id: got, errno } if Some(got) == id => Err(io::Error::from_raw_os_error(errno)),
+                    Frame::Bell | Frame::Fail { .. } => Ok(()),
+                    _ => Err(io::Error::other("unexpected frame from netd")),
+                })?,
+                Io::Blocked => break,
             }
         }
         // application -> ring
         let mut want_in = false;
+        let mut eof_bell = false;
         while !app_eof {
             let (k, n) = tx.free_iov(iov, CHUNK)?;
             if n == 0 {
@@ -379,9 +390,7 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, st: &mut 
             match io_result(unsafe { libc::readv(t, iov.as_ptr(), k as i32) })? {
                 Io::Done(0) => {
                     app_eof = true;
-                    if tx.close() {
-                        doorbell(v);
-                    }
+                    eof_bell = tx.close();
                 }
                 Io::Done(r) => {
                     cnt.reads += 1;
@@ -436,8 +445,13 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, st: &mut 
         }
 
         if app_eof && wr_shut {
-            // netd flushes whatever is left in the guest->host ring.
+            // netd flushes whatever is left in the guest->host ring once the
+            // caller tells it (Close, or closing a forward's stream), which
+            // also stands in for the EOF doorbell.
             return Ok(());
+        }
+        if eof_bell {
+            doorbell(v);
         }
 
         let tev = if want_in { libc::POLLIN } else { 0 } | if want_out { libc::POLLOUT } else { 0 };
@@ -505,7 +519,7 @@ fn spin(rx: &Consumer, ring_out: bool, t: RawFd, tev: libc::c_short) -> io::Resu
             return Ok(true);
         }
         // Not a pause: whatever this thread just sent on vsock (request,
-        // status, doorbell) waits in a kworker on this CPU (see relay()).
+        // status, doorbell) waits in a kworker on this CPU (see doorbell()).
         unsafe { libc::sched_yield() };
     }
     Ok(false)

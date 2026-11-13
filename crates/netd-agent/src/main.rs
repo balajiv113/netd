@@ -165,15 +165,11 @@ fn serve_outbound(tcp: TcpStream, fixed_dst: Option<SocketAddr>, cfg: &Config, p
         Some(d) => d,
         None => original_dst(tcp.as_raw_fd(), tcp.local_addr()?.is_ipv6())?,
     };
-    let mut up = File::from(pool.take()?);
-    let (slot, idx) = shm::offer(&cfg.region);
-    up.write_all(&Request::tcp(dst, idx).encode())?;
-    if let Some(s) = slot {
-        // The guest application is already connected (to us), so there is
-        // nothing to wait for: payload goes into the ring while netd connects,
-        // and relay() resets the connection if netd's status says otherwise.
-        return shm::relay(tcp.into(), up.into(), s, Some(idx));
+    if let Some(slot) = cfg.region.as_ref().and_then(|r| r.claim()) {
+        return shm::relay_out(tcp.into(), slot, dst);
     }
+    let mut up = File::from(pool.take()?);
+    up.write_all(&Request::tcp(dst, NO_SLOT).encode())?;
     let (st, got) = proto::read_status(&mut up)?;
     if st != 0 {
         // Close the guest connection; the app sees a reset/EOF.
@@ -202,7 +198,7 @@ fn serve_inbound(conn: OwnedFd, region: &Option<Arc<shm::Region>>) -> io::Result
     let (slot, idx) = shm::offer(region);
     proto::write_status(&mut f, 0, idx)?;
     match slot {
-        Some(s) => shm::relay(tcp.into(), f.into(), s, None),
+        Some(s) => shm::relay_in(tcp.into(), f.into(), s),
         None => {
             relay::relay_dirs(f.into(), tcp.into(), true, SPLICE_TO_VSOCK.load(Ordering::Relaxed));
             Ok(())

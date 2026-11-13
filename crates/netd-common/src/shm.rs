@@ -13,9 +13,9 @@
 //!
 //! Positions are free-running u64 byte counters. A side that runs out of
 //! work sets its wait flag and re-checks; the other side clears the flag and
-//! rings the doorbell (one byte on the connection's vsock stream) only when
-//! it was set. EOF travels in the ring as well, so the vsock stream stays
-//! usable for doorbells in both directions until the connection ends.
+//! rings the doorbell (a `Frame::Bell` on the slot's vsock stream) only when
+//! it was set. EOF travels in the ring as well, so the stream stays usable
+//! for doorbells in both directions until the connection ends.
 //!
 //! The host treats everything in shared memory as untrusted: positions are
 //! validated before use and all accesses stay inside the registered ring.

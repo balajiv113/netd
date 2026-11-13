@@ -12,8 +12,9 @@
 //!
 //! When the agent has registered shared rings (netd_common::shm), connections
 //! that hold a slot bypass vsock packets entirely: netd moves payload between
-//! the host socket and the rings in guest memory, and the vsock stream only
-//! carries the handshake and one-byte doorbells.
+//! the host socket and the rings in guest memory. Outbound connections run on
+//! the slot's long-lived stream, which only carries proto::Frame messages;
+//! port forwards keep a stream each, carrying the handshake and doorbells.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -22,7 +23,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use netd_common::proto::{self, Msg, PROTO_TCP, Request, STATUS_LEN, ShmRegion};
+use netd_common::proto::{self, Frame, FrameReader, Msg, PROTO_TCP, Request, STATUS_LEN, ShmRegion};
 use netd_common::shm::{CHUNK, Consumer, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringRwLock, VringState, VringT};
@@ -197,6 +198,8 @@ enum State {
     Failed,
     /// The agent's shared-ring registration stream; carries no payload.
     Registration,
+    /// A slot stream between two connections.
+    SlotIdle,
 }
 
 /// The agent's registered rings. The memory snapshot keeps the mappings
@@ -206,6 +209,8 @@ struct ShmTable {
     ctl: *mut u8,
     rings: Vec<*mut u8>,
     in_use: Vec<bool>,
+    /// The slot has its stream.
+    bound: Vec<bool>,
 }
 
 /// A connection's rings: netd consumes guest->host and produces host->guest.
@@ -242,8 +247,12 @@ struct Conn {
     wr_shut: bool,
     guest_shut_send: bool,
     guest_shut_rcv: bool,
-    /// Slot the agent asked for in its request.
-    want_slot: u16,
+    /// A slot stream: its slot, the current connection's id, whether the
+    /// agent has finished that connection (Close), and partial frames.
+    bound: Option<u16>,
+    conn_id: u32,
+    guest_done: bool,
+    frames: FrameReader,
     shm: Option<ShmConn>,
     /// The last pump stopped at a full ring or socket (see pump_shm).
     bulk: bool,
@@ -272,10 +281,26 @@ impl Conn {
             wr_shut: false,
             guest_shut_send: false,
             guest_shut_rcv: false,
-            want_slot: NO_SLOT,
+            bound: None,
+            conn_id: 0,
+            guest_done: false,
+            frames: FrameReader::default(),
             shm: None,
             bulk: false,
         }
+    }
+
+    /// Forgets the host connection of a slot stream, keeping the stream.
+    fn clear_conn(&mut self) {
+        self.sock = None;
+        self.state = State::SlotIdle;
+        self.txq.clear();
+        self.readable = false;
+        self.writable = false;
+        self.sock_eof = false;
+        self.wr_shut = false;
+        self.guest_done = false;
+        self.bulk = false;
     }
 
     fn peer_credit(&self) -> usize {
@@ -783,7 +808,6 @@ impl Dev {
     }
 
     fn start_connect(&mut self, tok: u64, req: Request) {
-        self.conns.get_mut(&tok).unwrap().want_slot = req.slot;
         let res = if req.proto == PROTO_TCP {
             connect_nb(crate::map_dst(&self.aliases, req.dst)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
         } else {
@@ -814,11 +838,18 @@ impl Dev {
     }
 
     fn connected(&mut self, tok: u64) {
-        let want = self.conns[&tok].want_slot;
-        let slot = if self.attach_slot(tok, want) { want } else { NO_SLOT };
+        if let Some(slot) = self.conns[&tok].bound {
+            // Slot streams only hear back on failure.
+            if !self.attach_slot(tok, slot) {
+                self.end(tok, Some(libc::EIO));
+                return;
+            }
+        }
         let c = self.conns.get_mut(&tok).unwrap();
         c.state = State::Relay;
-        c.prefix.extend_from_slice(&proto::encode_status(0, slot));
+        if c.bound.is_none() {
+            c.prefix.extend_from_slice(&proto::encode_status(0, NO_SLOT));
+        }
         c.writable = true;
         c.readable = true;
         self.rx_ready.insert(tok);
@@ -840,13 +871,89 @@ impl Dev {
         };
         let ctl = map(r.ctl_gpa, r.slots() * SLOT_CTL)?;
         let rings = r.ring_gpas.iter().map(|&g| map(g, RING_SIZE)).collect::<Result<Vec<_>, _>>()?;
-        let old: Vec<u64> = self.conns.iter().filter(|(_, c)| c.shm.is_some()).map(|(&t, _)| t).collect();
+        let old: Vec<u64> = self.conns.iter().filter(|(_, c)| c.shm.is_some() || c.bound.is_some()).map(|(&t, _)| t).collect();
         for tok in old {
             self.reset(tok);
         }
-        self.shm = Some(ShmTable { _mem: guard.into_inner(), ctl, rings, in_use: vec![false; r.slots()] });
+        let n = r.slots();
+        self.shm = Some(ShmTable { _mem: guard.into_inner(), ctl, rings, in_use: vec![false; n], bound: vec![false; n] });
         eprintln!("netd: shared rings registered ({} slots)", r.slots());
         Ok(())
+    }
+
+    /// Makes the stream `slot`'s stream; returns the status for the agent.
+    fn bind_slot(&mut self, tok: u64, slot: u16) -> i32 {
+        let Some(t) = self.shm.as_mut() else { return libc::ENODEV };
+        let i = slot as usize;
+        if i >= t.bound.len() || t.bound[i] {
+            return libc::EINVAL;
+        }
+        t.bound[i] = true;
+        let c = self.conns.get_mut(&tok).unwrap();
+        c.bound = Some(slot);
+        c.state = State::SlotIdle;
+        0
+    }
+
+    fn slot_ctl(&self, slot: u16) -> Option<&SlotCtl> {
+        let t = self.shm.as_ref()?;
+        // SAFETY: slot < slots (checked at bind), and the control block stays
+        // mapped while the table holds the memory.
+        (usize::from(slot) < t.bound.len()).then(|| unsafe { &*(t.ctl.add(usize::from(slot) * SLOT_CTL) as *const SlotCtl) })
+    }
+
+    /// Handles a frame from the agent on a slot stream.
+    fn slot_frame(&mut self, tok: u64, f: Frame) {
+        let Some(c) = self.conns.get_mut(&tok) else { return };
+        match (f, c.state) {
+            (Frame::Bell, _) => {
+                if c.shm.is_some() {
+                    self.stats.bells_in += 1;
+                    self.shm_ready.insert(tok);
+                }
+            }
+            (Frame::Open { id, dst }, State::SlotIdle) => {
+                c.conn_id = id;
+                self.start_connect(tok, Request::tcp(dst, NO_SLOT));
+            }
+            // A connection netd already ended (Fail) or that has not started.
+            (Frame::Close | Frame::Reset, State::SlotIdle) => {}
+            (Frame::Close, _) => {
+                c.guest_done = true;
+                self.shm_ready.insert(tok);
+                self.check_done(tok);
+            }
+            (Frame::Reset, _) => {
+                c.guest_done = true;
+                self.end(tok, None);
+            }
+            _ => self.reset(tok),
+        }
+    }
+
+    /// Ends the connection on a slot stream: the host socket closes, the
+    /// slot is free for the agent's next connection and, unless the agent
+    /// ended it, `err` tells it why. Other streams are reset.
+    fn end(&mut self, tok: u64, err: Option<i32>) {
+        let Some(c) = self.conns.get_mut(&tok) else { return };
+        let Some(slot) = c.bound else {
+            self.reset(tok);
+            return;
+        };
+        if let Some(e) = err.filter(|_| !c.guest_done) {
+            Frame::Fail { id: c.conn_id, errno: e }.encode(&mut c.prefix);
+            self.rx_ready.insert(tok);
+        }
+        let shm = c.shm.take();
+        c.clear_conn();
+        if let (Some(s), Some(t)) = (shm, self.shm.as_mut()) {
+            t.in_use[s.slot as usize] = false;
+        }
+        if let Some(ctl) = self.slot_ctl(slot) {
+            ctl.release();
+        }
+        self.tx_ready.remove(&tok);
+        self.shm_ready.remove(&tok);
     }
 
     /// Binds `slot` of the registered rings to the connection.
@@ -879,7 +986,7 @@ impl Dev {
                 Ok(bell) => {
                     // One pending byte is enough to wake the agent.
                     if bell && !c.guest_shut_rcv && c.prefix.is_empty() {
-                        c.prefix.push(0);
+                        Frame::Bell.encode(&mut c.prefix);
                         self.stats.bells_out += 1;
                         self.rx_ready.insert(tok);
                     }
@@ -888,13 +995,17 @@ impl Dev {
                     }
                     self.check_done(tok);
                 }
-                Err(_) => self.reset(tok),
+                Err(_) => self.end(tok, Some(libc::ECONNRESET)),
             }
         }
     }
 
     /// Reports a setup error to the guest agent; the agent then closes.
     fn fail(&mut self, tok: u64, err: i32) {
+        if self.conns[&tok].bound.is_some() {
+            self.end(tok, Some(err));
+            return;
+        }
         let c = self.conns.get_mut(&tok).unwrap();
         c.state = State::Failed;
         c.sock = None;
@@ -906,10 +1017,20 @@ impl Dev {
     fn remove(&mut self, tok: u64) {
         if let Some(c) = self.conns.remove(&tok) {
             self.ports.remove(&(c.local_port, c.peer_port));
-            if let (Some(s), Some(t)) = (c.shm, self.shm.as_mut()) {
+            if let (Some(s), Some(t)) = (&c.shm, self.shm.as_mut()) {
                 t.in_use[s.slot as usize] = false;
                 // SAFETY: mapped while the table lives; this is netd's last access.
                 unsafe { (*s.ctl).release() };
+            }
+            if let Some(slot) = c.bound {
+                if c.state != State::SlotIdle
+                    && let Some(ctl) = self.slot_ctl(slot)
+                {
+                    ctl.release();
+                }
+                if let Some(t) = self.shm.as_mut() {
+                    t.bound[slot as usize] = false;
+                }
             }
         }
         self.rx_ready.remove(&tok);
@@ -941,12 +1062,17 @@ impl Dev {
     fn check_done(&mut self, tok: u64) {
         let Some(c) = self.conns.get_mut(&tok) else { return };
         if let Some(s) = &c.shm {
-            // EOF travels in the rings; the agent closes its vsock end when it
-            // is done, possibly leaving payload in the ring for netd to flush.
-            if c.guest_shut_send && c.guest_shut_rcv && (c.wr_shut || !matches!(s.tx.avail(), Ok(n) if n > 0)) {
-                self.reset(tok);
+            // EOF travels in the rings; the agent says when it is done
+            // (Close, or closing a forward's stream), possibly leaving payload
+            // in the ring for netd to flush.
+            let done = if c.bound.is_some() { c.guest_done } else { c.guest_shut_send && c.guest_shut_rcv };
+            if done && (c.wr_shut || !matches!(s.tx.avail(), Ok(n) if n > 0)) {
+                self.end(tok, None);
             }
             return;
+        }
+        if c.bound.is_some() {
+            return; // still connecting; the rings are attached once connected
         }
         if !c.txq.is_empty() {
             return;
@@ -1085,6 +1211,9 @@ impl Dev {
             OP_CREDIT_REQUEST => {
                 self.ctl.push_back(Ctl { local_port: key.0, peer_port: key.1, op: OP_CREDIT_UPDATE, flags: 0 })
             }
+            // The agent only closes a slot stream when it gives up the
+            // registration.
+            OP_SHUTDOWN if c.bound.is_some() => self.reset(tok),
             OP_SHUTDOWN => {
                 c.guest_shut_send |= h.flags & SHUT_SEND != 0;
                 c.guest_shut_rcv |= h.flags & SHUT_RCV != 0;
@@ -1122,6 +1251,15 @@ impl Dev {
                 c.hs.clear();
                 match parsed {
                     Ok(Msg::Connect(req)) => self.start_connect(tok, req),
+                    Ok(Msg::Slot(slot)) => {
+                        let err = self.bind_slot(tok, slot);
+                        let c = self.conns.get_mut(&tok).unwrap();
+                        c.prefix.extend_from_slice(&proto::encode_status(err, slot));
+                        if err != 0 {
+                            c.state = State::Failed;
+                        }
+                        self.rx_ready.insert(tok);
+                    }
                     Ok(Msg::Shm(r)) => {
                         let err = self.register_shm(&r).err().unwrap_or(0);
                         let c = self.conns.get_mut(&tok).unwrap();
@@ -1150,6 +1288,29 @@ impl Dev {
             break;
         }
         let Some(c) = self.conns.get_mut(&tok) else { return };
+        if c.bound.is_some() && c.state != State::ReadReq {
+            c.fwd_cnt = c.fwd_cnt.wrapping_add(len as u32);
+            let mut b = vec![0u8; len];
+            segs_read(segs, off, &mut b);
+            let mut frames = std::mem::take(&mut c.frames);
+            let mut got = Vec::new();
+            let ok = frames
+                .feed(&b, |f| {
+                    got.push(f);
+                    Ok(())
+                })
+                .is_ok();
+            for f in got {
+                self.slot_frame(tok, f);
+            }
+            match self.conns.get_mut(&tok) {
+                Some(c) if ok => c.frames = frames,
+                Some(_) => self.reset(tok),
+                None => return,
+            }
+            self.maybe_credit(tok);
+            return;
+        }
         if c.shm.is_some() || c.state == State::Registration {
             // Doorbells (or nothing at all): the payload is in the rings.
             c.fwd_cnt = c.fwd_cnt.wrapping_add(len as u32);
@@ -1303,7 +1464,9 @@ impl Dev {
     fn rx_conn(&mut self, tok: u64, st: &mut VState, mem: &Mem, used: &mut bool) -> Rx {
         let Some(c) = self.conns.get(&tok) else { return Rx::Idle };
         let credit = c.peer_credit();
-        if !c.prefix.is_empty() && matches!(c.state, State::AwaitStatus | State::Relay | State::Failed | State::Registration) {
+        if !c.prefix.is_empty()
+            && (c.bound.is_some() || matches!(c.state, State::AwaitStatus | State::Relay | State::Failed | State::Registration))
+        {
             if credit == 0 {
                 return Rx::Idle;
             }
