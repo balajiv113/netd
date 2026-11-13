@@ -258,6 +258,7 @@ struct Conn {
     shm: Option<ShmConn>,
     /// The last pump stopped at a full ring or socket (see pump_shm).
     bulk: bool,
+    last_activity: Instant,
 }
 
 impl Conn {
@@ -289,6 +290,7 @@ impl Conn {
             frames: FrameReader::default(),
             shm: None,
             bulk: false,
+            last_activity: Instant::now(),
         }
     }
 
@@ -308,6 +310,10 @@ impl Conn {
     fn peer_credit(&self) -> usize {
         let inflight = self.tx_cnt.wrapping_sub(self.peer_fwd_cnt);
         self.peer_buf_alloc.saturating_sub(inflight) as usize
+    }
+
+    fn poll_eligible(&self, now: Instant, budget: Duration) -> bool {
+        self.shm.is_some() && !self.bulk && now.duration_since(self.last_activity) < budget
     }
 
     /// Moves payload between the host socket and the shared rings until
@@ -480,6 +486,7 @@ struct Dev {
     shm_ready: HashSet<u64>,
     shm: Option<ShmTable>,
     busy_poll: Duration,
+    polling: bool,
     yield_fd: OwnedFd,
     segs: Vec<Seg>,
     iov: Vec<libc::iovec>,
@@ -643,6 +650,7 @@ impl Dev {
             shm_ready: HashSet::new(),
             shm: None,
             busy_poll: cfg.busy_poll,
+            polling: false,
             yield_fd,
             segs: Vec::with_capacity(512),
             iov: Vec::with_capacity(512),
@@ -663,17 +671,21 @@ impl Dev {
             self.flush_tx_ready();
             // While busy-polling, the rings are serviced without arming their
             // wait flags, so the agent has no reason to ring the doorbell.
-            let busy = !self.busy_poll.is_zero() && self.conns.values().any(|c| c.shm.is_some() && !c.bulk);
-            let toks: Vec<u64> = if busy { self.shm_conns() } else { self.shm_ready.iter().copied().collect() };
+            let now = Instant::now();
+            let busy = self.conns.values().any(|c| c.poll_eligible(now, self.busy_poll));
+            let toks: Vec<u64> = if busy || self.polling { self.shm_conns() } else { self.shm_ready.iter().copied().collect() };
             self.shm_ready.clear();
             self.pump_shm(toks, !busy);
             self.process_rx(&vrings[RXQ], mem)?;
             if !busy {
-                if self.shm_ready.is_empty() {
+                self.polling = false;
+                let now = Instant::now();
+                if self.shm_ready.is_empty() && !self.conns.values().any(|c| c.poll_eligible(now, self.busy_poll)) {
                     break;
                 }
                 continue;
             }
+            self.polling = true;
             self.stats.busy_polls += 1;
             if self.stats.work() != before {
                 last_work = Instant::now();
@@ -689,7 +701,8 @@ impl Dev {
                 let toks = self.shm_conns();
                 self.pump_shm(toks, true);
                 self.process_rx(&vrings[RXQ], mem)?;
-                if self.stats.work() == before {
+                if self.stats.work() == before && self.shm_ready.is_empty() {
+                    self.polling = false;
                     break;
                 }
                 last_work = Instant::now();
@@ -756,6 +769,7 @@ impl Dev {
                     }
                 }
                 if c.shm.is_some() {
+                    c.last_activity = Instant::now();
                     self.shm_ready.insert(tok);
                 }
             }
@@ -910,6 +924,7 @@ impl Dev {
         match (f, c.state) {
             (Frame::Bell, _) => {
                 if c.shm.is_some() {
+                    c.last_activity = Instant::now();
                     self.stats.bells_in += 1;
                     self.shm_ready.insert(tok);
                 }
@@ -974,7 +989,9 @@ impl Dev {
             let h2g = Ring::new(&(*ctl).h2g, t.rings[2 * i + 1]);
             ShmConn { slot, ctl, tx: Consumer::new(g2h), rx: Producer::new(h2g) }
         };
-        self.conns.get_mut(&tok).unwrap().shm = Some(sc);
+        let c = self.conns.get_mut(&tok).unwrap();
+        c.shm = Some(sc);
+        c.last_activity = Instant::now();
         true
     }
 
@@ -984,7 +1001,12 @@ impl Dev {
             if c.state != State::Relay {
                 continue;
             }
-            match c.pump_shm(&mut self.stats, arm) {
+            let before = self.stats.shm_tx_bytes + self.stats.shm_rx_bytes;
+            let result = c.pump_shm(&mut self.stats, arm);
+            if self.stats.shm_tx_bytes + self.stats.shm_rx_bytes != before {
+                c.last_activity = Instant::now();
+            }
+            match result {
                 Ok(bell) => {
                     // One pending byte is enough to wake the agent.
                     if bell && !c.guest_shut_rcv && c.prefix.is_empty() {
@@ -1317,6 +1339,7 @@ impl Dev {
             // Doorbells (or nothing at all): the payload is in the rings.
             c.fwd_cnt = c.fwd_cnt.wrapping_add(len as u32);
             if len > 0 && c.shm.is_some() {
+                c.last_activity = Instant::now();
                 self.stats.bells_in += 1;
                 self.shm_ready.insert(tok);
             }
@@ -1720,5 +1743,15 @@ mod tests {
         assert_eq!(stats.shm_tx_bytes, SHM_TX_BATCH as u64);
         assert_eq!(stats.shm_tx_writes, 1);
         assert_eq!(c.shm.as_ref().unwrap().tx.avail().unwrap(), 0);
+
+        let now = Instant::now();
+        let budget = Duration::from_micros(50);
+        c.last_activity = now - budget;
+        assert!(!c.poll_eligible(now, budget));
+        c.last_activity = now;
+        assert!(c.poll_eligible(now, budget));
+        assert!(!c.poll_eligible(now, Duration::ZERO));
+        c.bulk = true;
+        assert!(!c.poll_eligible(now, budget));
     }
 }

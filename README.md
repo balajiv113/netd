@@ -35,8 +35,10 @@ Connections without a free slot fall back to payload over vsock.
 
 Doorbells cost a guest kernel round trip, a VM exit and an interrupt, so both
 sides poll briefly before arming them: netd's worker keeps servicing active
-rings for `--busy-poll-us` (default 50) after the last work, like vhost-net's
-busyloop, and the agent spins for `--spin-us` (default 50) before sleeping.
+rings for `--busy-poll-us` (default 50) after each connection's last work,
+like vhost-net's busyloop, and the agent spins for `--spin-us` (default 50)
+before sleeping. Work on one connection does not extend an idle connection's
+polling budget.
 For outbound connections the agent initially spins for 200 µs, until the
 first response or 256 KiB of outbound data; an explicit `--spin-us` sets
 both budgets. Set either option to zero to disable polling on that side.
