@@ -19,6 +19,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -37,7 +38,7 @@ NBENCH_PORT = 7000
 TAP = "nbtap0"
 
 ARGS_VCPUS = 2
-ALL = ["native", "tap-vhost", "slirp", "gvproxy", "passt", "passt-vu", "netd"]
+ALL = ["native", "guest-lo", "tap-vhost", "slirp", "gvproxy", "passt", "passt-vu", "netd"]
 NETD = ["netd"]
 BASELINE = Path(__file__).resolve().parent / "baseline" / "linux-kvm.json"
 
@@ -354,7 +355,23 @@ class Netd(Contender):
         return "127.0.0.1", FWD_HOST_PORT
 
 
-CLASSES = {c.name: c for c in [TapVhost, Slirp, Gvproxy, Passt, PasstVU, Netd]}
+class GuestLo(Contender):
+    """Reference: client and servers both inside the guest, over loopback. Any
+    guest-agent design (netd's included) also pays for the guest's TCP stack
+    and its vCPUs, so this is the ceiling for it."""
+    name = "guest-lo"
+    host_ip = "127.0.0.1"
+    mtu_note = "guest loopback, no host networking (reference)"
+
+    def guest_setup(self, g):
+        g.run(f"iperf3 -s -D -p 5201 && (nohup /usr/local/bin/nbench server 0.0.0.0:{NBENCH_PORT} >/dev/null 2>&1 &)")
+        time.sleep(0.5)
+
+    def setup_forward(self, g):
+        raise RuntimeError("not applicable")
+
+
+CLASSES = {c.name: c for c in [TapVhost, Slirp, Gvproxy, Passt, PasstVU, Netd, GuestLo]}
 
 
 def iperf_gbps(js):
@@ -415,11 +432,12 @@ def run_contender(name, args):
     # "netd@--spin-us,0" runs netd with extra (comma-separated) agent arguments.
     base, _, variant = name.partition("@")
     c = CLASSES[base](procs, variant)
-    c.name = name
-    overlay = W / f"{name}.qcow2"
+    tag = re.sub(r"[^A-Za-z0-9_.-]", "_", name)  # QEMU options split on commas
+    c.name = tag
+    overlay = W / f"{tag}.qcow2"
     overlay.unlink(missing_ok=True)
     sh(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", "base.qcow2", overlay])
-    qga_path = W / f"{name}-qga.sock"
+    qga_path = W / f"{tag}-qga.sock"
     qga_path.unlink(missing_ok=True)
     res = {"mtu": c.mtu_note}
     try:
@@ -431,12 +449,12 @@ def run_contender(name, args):
             "-drive", f"file={overlay},if=virtio,cache=unsafe",
             "-chardev", f"socket,id=qga0,path={qga_path},server=on,wait=off",
             "-device", "virtio-serial-pci", "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
-            "-serial", f"file:{W}/{name}-console.log",
+            "-serial", f"file:{W}/{tag}-console.log",
         ] + c.qemu_net()
-        qp = c.spawn(qemu, f"{name}-qemu")
+        qp = c.spawn(qemu, f"{tag}-qemu")
         wait_path(qga_path)
         g = QGA(qga_path)
-        g.wait(proc=qp, console=W / f"{name}-console.log")
+        g.wait(proc=qp, console=W / f"{tag}-console.log")
         log(f"[{name}] guest up")
         c.guest_setup(g)
         pids = {"qemu": qp.pid}
@@ -484,7 +502,7 @@ def run_contender(name, args):
         log(f"[{name}] fwd1: {res['fwd1']}")
         try:
             _, out, _ = g.run("cat /var/log/netd-agent.log 2>/dev/null; echo ---; dmesg | tail -50", timeout=20, check=False)
-            (W / f"{name}-guest.log").write_text(out)
+            (W / f"{tag}-guest.log").write_text(out)
         except Exception:
             pass
         try:
