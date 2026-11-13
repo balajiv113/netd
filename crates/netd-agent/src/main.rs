@@ -10,6 +10,7 @@
 //! With netd's vhost-user device, connections carry their payload through
 //! shared rings in guest hugepages (see `shm`) instead of the vsock stream.
 
+mod pool;
 mod shm;
 
 use std::fs::File;
@@ -25,6 +26,7 @@ use std::thread;
 use netd_common::proto::{self, Msg, PROTO_TCP, Request};
 use netd_common::shm::{MAX_SLOTS, NO_SLOT};
 use netd_common::{relay, sock};
+use pool::{Origin, Pool};
 
 const USAGE: &str = "usage: netd-agent [options]
   --listen ADDR          redirect target for outbound TCP (default 0.0.0.0:15001);
@@ -39,6 +41,8 @@ const USAGE: &str = "usage: netd-agent [options]
                          shared memory (default 16, 0 = off)
   --spin-us US           busy-poll the shared rings this long before sleeping
                          (default 50, 0 = off)
+  --pool N               pre-connected netd streams kept for new outbound
+                         connections (default 4, 0 = connect on demand)
   --vsock-buf BYTES      vsock credit window (default 4194304)
   --splice-to-vsock 0|1  splice guest TCP -> vsock (default 1; 0 = plain writes)";
 
@@ -60,6 +64,7 @@ struct Config {
     inbound_unix: Option<String>,
     vsock_buf: u64,
     shm_slots: usize,
+    pool_size: usize,
     region: Option<Arc<shm::Region>>,
 }
 
@@ -82,6 +87,7 @@ fn parse_args() -> Config {
         inbound_unix: None,
         vsock_buf: 4 << 20,
         shm_slots: 16,
+        pool_size: 4,
         region: None,
     };
     let mut args = std::env::args().skip(1);
@@ -110,6 +116,7 @@ fn parse_args() -> Config {
                     die(&format!("--shm-slots is at most {MAX_SLOTS}"));
                 }
             }
+            "--pool" => c.pool_size = parse(&v, "pool size"),
             "--vsock-buf" => c.vsock_buf = parse(&v, "size"),
             "--spin-us" => shm::set_spin_us(parse(&v, "microseconds")),
             "--splice-to-vsock" => SPLICE_TO_VSOCK.store(v == "1", Ordering::Relaxed),
@@ -152,16 +159,31 @@ fn connect_upstream(u: &Upstream, vsock_buf: u64) -> io::Result<OwnedFd> {
     }
 }
 
-fn serve_outbound(tcp: TcpStream, fixed_dst: Option<SocketAddr>, cfg: &Config) -> io::Result<()> {
+/// Sends the connect request for `dst` offering ring slot `idx`; returns the
+/// stream and netd's (status, slot) reply.
+fn request(pool: &Pool, dst: SocketAddr, idx: u16) -> io::Result<(File, i32, u16)> {
+    let attempt = |fd: OwnedFd| {
+        let mut up = File::from(fd);
+        up.write_all(&Request::tcp(dst, idx).encode())?;
+        let (st, got) = proto::read_status(&mut up)?;
+        Ok((up, st, got))
+    };
+    let (fd, origin) = pool.take()?;
+    match attempt(fd) {
+        // An idle stream may have been reset under us; netd never saw it.
+        Err(_) if matches!(origin, Origin::Pooled) => attempt(pool.fresh()?),
+        r => r,
+    }
+}
+
+fn serve_outbound(tcp: TcpStream, fixed_dst: Option<SocketAddr>, cfg: &Config, pool: &Pool) -> io::Result<()> {
     tcp.set_nodelay(true)?;
     let dst = match fixed_dst {
         Some(d) => d,
         None => original_dst(tcp.as_raw_fd(), tcp.local_addr()?.is_ipv6())?,
     };
-    let mut up = File::from(connect_upstream(&cfg.upstream, cfg.vsock_buf)?);
     let (slot, idx) = shm::offer(&cfg.region);
-    up.write_all(&Request::tcp(dst, idx).encode())?;
-    let (st, got) = proto::read_status(&mut up)?;
+    let (up, st, got) = request(pool, dst, idx)?;
     match slot {
         Some(s) if st == 0 && got == idx => return shm::relay(tcp.into(), up.into(), s),
         Some(s) => s.give_back(),
@@ -258,17 +280,19 @@ fn main() {
             (t, l.fixed_dst)
         })
         .collect();
+    let (up, buf) = (cfg.upstream.clone(), cfg.vsock_buf);
+    let pool = Pool::new(cfg.pool_size, Box::new(move || connect_upstream(&up, buf)));
     let cfg = Arc::new(cfg);
     let mut handles = Vec::new();
     for (l, fixed_dst) in listeners {
-        let cfg = cfg.clone();
+        let (cfg, pool) = (cfg.clone(), pool.clone());
         handles.push(thread::spawn(move || {
             for c in l.incoming() {
                 match c {
                     Ok(t) => {
-                        let cfg = cfg.clone();
+                        let (cfg, pool) = (cfg.clone(), pool.clone());
                         thread::spawn(move || {
-                            if let Err(e) = serve_outbound(t, fixed_dst, &cfg) {
+                            if let Err(e) = serve_outbound(t, fixed_dst, &cfg, &pool) {
                                 eprintln!("netd-agent: outbound: {e}");
                             }
                         });
