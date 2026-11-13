@@ -15,6 +15,10 @@ on:
         description: "iperf3 seconds per test"
         required: false
         default: "10"
+      rounds:
+        description: "repeat all contenders this many times (interleaved) and report medians"
+        required: false
+        default: "1"
   push:
     branches: [main]
     paths: ["crates/**", "bench/**", ".github/workflows/bench.yml"]
@@ -97,7 +101,7 @@ jobs:
         run: bench/provision.sh
 
       - name: Run benchmark
-        run: python3 bench/run.py ${{ github.event.inputs.contenders }} --secs ${{ github.event.inputs.secs || '10' }}
+        run: python3 bench/run.py ${{ github.event.inputs.contenders }} --secs ${{ github.event.inputs.secs || '10' }} --rounds ${{ github.event.inputs.rounds || '1' }}
 
       - name: Upload results
         if: always()
