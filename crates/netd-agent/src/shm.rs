@@ -53,8 +53,13 @@ pub struct Region {
     /// its side.
     generation: AtomicU64,
     /// Each slot's stream to netd (see proto::Frame), for the current registration.
-    streams: Mutex<Vec<Arc<OwnedFd>>>,
+    streams: Mutex<Vec<Arc<SlotStream>>>,
     next_id: AtomicU32,
+}
+
+struct SlotStream {
+    fd: OwnedFd,
+    frames: Mutex<FrameReader>,
 }
 
 // SAFETY: the hugepage mapping is never unmapped; slot ownership is tracked
@@ -200,7 +205,7 @@ impl Region {
                 (e, _) => return Err(io::Error::from_raw_os_error(e)),
             }
             set_nonblocking(f.as_raw_fd(), true)?;
-            streams.push(Arc::new(OwnedFd::from(f)));
+            streams.push(Arc::new(SlotStream { fd: f.into(), frames: Mutex::new(FrameReader::default()) }));
         }
         // A new registration starts clean on netd's side: slots that only
         // netd still held (before it restarted) are free again.
@@ -240,7 +245,7 @@ pub struct Slot {
     region: Arc<Region>,
     idx: usize,
     generation: u64,
-    stream: Arc<OwnedFd>,
+    stream: Arc<SlotStream>,
 }
 
 impl Slot {
@@ -329,10 +334,11 @@ fn send(v: RawFd, f: Frame) -> io::Result<()> {
 /// payload goes into the ring while netd connects, and a Fail frame resets
 /// the connection if netd could not.
 pub fn relay_out(tcp: OwnedFd, slot: Slot, dst: SocketAddr) -> io::Result<()> {
-    let v = slot.stream.as_raw_fd();
+    let v = slot.stream.fd.as_raw_fd();
     let id = slot.region.next_id.fetch_add(1, Ordering::Relaxed);
     send(v, Frame::Open { id, dst })?;
-    let res = pump(tcp, v, &slot, Some(id));
+    let mut frames = slot.stream.frames.lock().unwrap();
+    let res = pump(tcp, v, &slot, Some(id), &mut frames);
     // Fails only if the stream is gone, and netd with it.
     let _ = send(v, if res.is_ok() { Frame::Close } else { Frame::Reset });
     res
@@ -342,27 +348,40 @@ pub fn relay_out(tcp: OwnedFd, slot: Slot, dst: SocketAddr) -> io::Result<()> {
 /// own stream, used only for doorbells, and closing it ends the connection.
 pub fn relay_in(tcp: OwnedFd, vs: OwnedFd, slot: Slot) -> io::Result<()> {
     set_nonblocking(vs.as_raw_fd(), true)?;
-    pump(tcp, vs.as_raw_fd(), &slot, None)
+    pump(tcp, vs.as_raw_fd(), &slot, None, &mut FrameReader::default())
 }
 
 /// `id`: the connection on a slot stream, whose Fail frame ends the relay.
-fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, id: Option<u32>) -> io::Result<()> {
+fn pump(tcp: OwnedFd, v: RawFd, slot: &Slot, id: Option<u32>, frames: &mut FrameReader) -> io::Result<()> {
     let t = tcp.as_raw_fd();
     set_nonblocking(t, true)?;
     let (mut tx, mut rx) = slot.rings();
     let mut cnt = Counters::default();
     let start = Instant::now();
-    let res = pump_loop(t, v, &mut tx, &mut rx, id, &mut cnt);
+    let res = pump_loop(t, v, &mut tx, &mut rx, id, frames, &mut cnt);
     if std::env::var_os("NETD_STATS").is_some() && cnt.bytes_in + cnt.bytes_out > 1 << 20 {
         eprintln!("netd-agent: relay {:?} {cnt:?}", start.elapsed());
     }
     res
 }
 
-fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Option<u32>, cnt: &mut Counters) -> io::Result<()> {
-    let iov = &mut [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+fn read_frames(v: RawFd, frames: &mut FrameReader, id: Option<u32>) -> io::Result<()> {
     let mut scratch = [0u8; 256];
-    let mut frames = FrameReader::default();
+    loop {
+        match io_result(unsafe { libc::read(v, scratch.as_mut_ptr().cast(), scratch.len()) })? {
+            Io::Done(0) => return Err(io::ErrorKind::ConnectionReset.into()),
+            Io::Done(n) => frames.feed(&scratch[..n], |f| match f {
+                Frame::Fail { id: got, errno } if Some(got) == id => Err(io::Error::from_raw_os_error(errno)),
+                Frame::Bell | Frame::Fail { .. } => Ok(()),
+                _ => Err(io::Error::other("unexpected frame from netd")),
+            })?,
+            Io::Blocked => return Ok(()),
+        }
+    }
+}
+
+fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Option<u32>, frames: &mut FrameReader, cnt: &mut Counters) -> io::Result<()> {
+    let iov = &mut [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
     let mut app_eof = false;
     let mut wr_shut = false;
     loop {
@@ -370,17 +389,7 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Optio
         // frames left over from the slot's earlier connections are ignored.
         // netd keeps the stream open while the agent uses it, so EOF here
         // means it went away.
-        loop {
-            match io_result(unsafe { libc::read(v, scratch.as_mut_ptr().cast(), scratch.len()) })? {
-                Io::Done(0) => return Err(io::ErrorKind::ConnectionReset.into()),
-                Io::Done(n) => frames.feed(&scratch[..n], |f| match f {
-                    Frame::Fail { id: got, errno } if Some(got) == id => Err(io::Error::from_raw_os_error(errno)),
-                    Frame::Bell | Frame::Fail { .. } => Ok(()),
-                    _ => Err(io::Error::other("unexpected frame from netd")),
-                })?,
-                Io::Blocked => break,
-            }
-        }
+        read_frames(v, frames, id)?;
         // application -> ring
         let mut want_in = false;
         let mut eof_bell = false;
@@ -543,6 +552,7 @@ fn spin(rx: &Consumer, ring_out: bool, t: RawFd, tev: libc::c_short, spin_us: u6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn startup_spin_ends_after_response_or_bulk_data() {
@@ -551,5 +561,26 @@ mod tests {
         assert_eq!(spin_budget(50, 200, true, STARTUP_LIMIT, 0), 50);
         assert_eq!(spin_budget(50, 200, false, 0, 0), 50);
         assert_eq!(spin_budget(0, 0, true, 0, 0), 0);
+    }
+
+    #[test]
+    fn split_stale_failure_survives_slot_reuse() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let stream = SlotStream { fd: reader.into(), frames: Mutex::new(FrameReader::default()) };
+        let mut failure = Vec::new();
+        Frame::Fail { id: 1, errno: libc::ECONNREFUSED }.encode(&mut failure);
+        writer.write_all(&failure[..3]).unwrap();
+        read_frames(stream.fd.as_raw_fd(), &mut stream.frames.lock().unwrap(), Some(1)).unwrap();
+
+        writer.write_all(&failure[3..]).unwrap();
+        writer.write_all(&[0]).unwrap();
+        read_frames(stream.fd.as_raw_fd(), &mut stream.frames.lock().unwrap(), Some(2)).unwrap();
+
+        failure.clear();
+        Frame::Fail { id: 2, errno: libc::ECONNREFUSED }.encode(&mut failure);
+        writer.write_all(&failure).unwrap();
+        let err = read_frames(stream.fd.as_raw_fd(), &mut stream.frames.lock().unwrap(), Some(2)).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ECONNREFUSED));
     }
 }
