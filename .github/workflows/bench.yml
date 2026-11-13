@@ -7,6 +7,10 @@ on:
         description: "space separated (empty = native + netd, others from the frozen baseline; 'all' = rerun everything)"
         required: false
         default: ""
+      base_ref:
+        description: "git ref built as the 'netd-base' contender, for A/B runs on the same runner"
+        required: false
+        default: ""
       secs:
         description: "iperf3 seconds per test"
         required: false
@@ -67,6 +71,15 @@ jobs:
       - name: Build netd
         run: |
           cargo build --release
+
+      - name: Build base ref (netd-base)
+        if: github.event.inputs.base_ref != ''
+        env:
+          BASE_REF: ${{ github.event.inputs.base_ref }}
+        run: |
+          git fetch -q --depth 1 origin "$BASE_REF"
+          git worktree add -q "$RUNNER_TEMP/base" FETCH_HEAD
+          cargo build --release --manifest-path "$RUNNER_TEMP/base/Cargo.toml" --target-dir target/base
 
       - name: Smoke test (netd, minimal guest)
         run: |

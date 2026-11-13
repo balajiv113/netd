@@ -11,6 +11,9 @@ IMG_URL=${IMG_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cl
 
 [ -f "$W/cloud.img" ] || curl -fsSL -o "$W/cloud.img" "$IMG_URL"
 cp target/release/netd-agent target/release/nbench "$W/"
+# Optional second build for A/B runs (the netd-base contender).
+rm -f "$W/netd-agent-base"
+[ ! -f target/base/release/netd-agent ] || cp target/base/release/netd-agent "$W/netd-agent-base"
 
 rm -f "$W/base.qcow2"
 qemu-img create -q -f qcow2 -F qcow2 -b cloud.img "$W/base.qcow2" 10G
@@ -37,6 +40,7 @@ runcmd:
   - curl -fsS -o /usr/local/bin/netd-agent http://10.0.2.2:8765/netd-agent
   - curl -fsS -o /usr/local/bin/nbench http://10.0.2.2:8765/nbench
   - chmod +x /usr/local/bin/netd-agent /usr/local/bin/nbench
+  - sh -c 'curl -fsS -o /usr/local/bin/netd-agent-base http://10.0.2.2:8765/netd-agent-base && chmod +x /usr/local/bin/netd-agent-base' || true
   - systemctl mask systemd-networkd-wait-online.service
   - systemctl disable unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer snapd.service snapd.socket || true
   - rm -f /etc/netplan/50-cloud-init.yaml

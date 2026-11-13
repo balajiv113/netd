@@ -333,7 +333,7 @@ else
   ip addr add 192.168.5.15/32 dev lo; ip route add default dev lo src 192.168.5.15
 fi
 iptables -t nat -A OUTPUT -p tcp ! -d 127.0.0.0/8 -j REDIRECT --to-ports 15001
-NETD_STATS=1 nohup /usr/local/bin/netd-agent {agent_args} >/var/log/netd-agent.log 2>&1 &
+NETD_STATS=1 nohup /usr/local/bin/{agent} {agent_args} >/var/log/netd-agent.log 2>&1 &
 sleep 0.5
 """
 
@@ -341,12 +341,14 @@ sleep 0.5
 class Netd(Contender):
     """netd is the vhost-user-vsock device; the guest runs netd-agent."""
     name = "netd"
+    bin = BIN
+    agent = "netd-agent"
     host_ip = "192.168.5.2"
     mtu_note = "n/a (socket offload, vhost-user-vsock, unprivileged)"
 
     def start_backend(self):
         (W / "netd-vu.sock").unlink(missing_ok=True)
-        self.spawn([BIN / "netd", "--vhost-user", f"{W}/netd-vu.sock", "--guest-cid", "3",
+        self.spawn([self.bin / "netd", "--vhost-user", f"{W}/netd-vu.sock", "--guest-cid", "3",
                     "--forward", f"127.0.0.1:{FWD_HOST_PORT}={GUEST_IPERF_PORT}"] + variant_args(self.variant, 1), "netd",
                    env={"NETD_STATS": "1"})
         wait_path(W / "netd-vu.sock")
@@ -355,10 +357,17 @@ class Netd(Contender):
         return ["-chardev", f"socket,id=c1,path={W}/netd-vu.sock", "-device", "vhost-user-vsock-pci,chardev=c1"]
 
     def guest_setup(self, g):
-        g.run(NETD_GUEST_SETUP.format(agent_args=shlex.join(variant_args(self.variant, 0))))
+        g.run(NETD_GUEST_SETUP.format(agent=self.agent, agent_args=shlex.join(variant_args(self.variant, 0))))
 
     def setup_forward(self, g):
         return "127.0.0.1", FWD_HOST_PORT
+
+
+class NetdBase(Netd):
+    """netd built from the workflow's base_ref (target/base), for A/B runs."""
+    name = "netd-base"
+    bin = ROOT / "target" / "base" / "release"
+    agent = "netd-agent-base"
 
 
 class GuestLo(Contender):
@@ -377,7 +386,7 @@ class GuestLo(Contender):
         raise RuntimeError("not applicable")
 
 
-CLASSES = {c.name: c for c in [TapVhost, Slirp, Gvproxy, Passt, PasstVU, Netd, GuestLo]}
+CLASSES = {c.name: c for c in [TapVhost, Slirp, Gvproxy, Passt, PasstVU, Netd, NetdBase, GuestLo]}
 
 
 def iperf_gbps(js):
@@ -569,7 +578,8 @@ def main():
     ap.add_argument("contenders", nargs="*", default=["native", *NETD],
                     help="default: native and netd, so percentages compare against the same runner; other contenders "
                          "come from the frozen baseline ('all' = rerun everything); "
-                         "netd@AGENT_ARGS@NETD_ARGS (comma-separated) adds netd-agent / netd arguments")
+                         "netd@AGENT_ARGS@NETD_ARGS (comma-separated) adds netd-agent / netd arguments; "
+                         "netd-base runs the build in target/base (the workflow's base_ref)")
     ap.add_argument("--baseline", default=str(BASELINE), help="frozen results merged into the report ('' = none)")
     ap.add_argument("--secs", type=int, default=10)
     ap.add_argument("--vcpus", type=int, default=2)
