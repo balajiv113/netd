@@ -20,6 +20,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use netd_common::proto::{self, Msg, PROTO_TCP, Request, STATUS_LEN, ShmRegion};
 use netd_common::shm::{Consumer, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
@@ -58,6 +59,11 @@ const BUF_ALLOC: u32 = 4 << 20;
 /// Upper bound of host->guest bytes moved by one readv.
 const RX_BATCH: usize = 1 << 20;
 const LISTENER_BIT: u64 = 1 << 63;
+/// epoll token of the eventfd the worker uses to reschedule itself.
+const YIELD_TOK: u64 = 0;
+/// Longest stretch the worker busy-polls before letting other users of the
+/// device lock (e.g. the vhost-user frontend thread) in.
+const MAX_POLL: Duration = Duration::from_millis(1);
 /// Host-side vsock ports for forwarded connections are allocated from here.
 const FIRST_HOST_PORT: u32 = 0x4000_0000;
 
@@ -70,6 +76,9 @@ pub struct Config {
     pub guest_port: u32,
     /// Non-blocking TCP listeners and the guest port each forwards to.
     pub forwards: Vec<(TcpListener, u16)>,
+    /// How long the worker keeps polling shared rings after the last work
+    /// before it sleeps (zero = event driven only).
+    pub busy_poll: Duration,
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
@@ -272,8 +281,10 @@ impl Conn {
     }
 
     /// Moves payload between the host socket and the shared rings until
-    /// both directions block. Returns true if the agent must be woken.
-    fn pump_shm(&mut self, stats: &mut Stats) -> io::Result<bool> {
+    /// both directions block. With `arm`, it then asks the agent for
+    /// doorbells where a ring is the obstacle. Returns true if the agent must
+    /// be woken.
+    fn pump_shm(&mut self, stats: &mut Stats, arm: bool) -> io::Result<bool> {
         let Some(s) = self.shm.as_mut() else { return Ok(false) };
         let fd = self.sock.as_ref().unwrap().as_raw_fd();
         let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
@@ -328,6 +339,9 @@ impl Conn {
                     self.readable = false;
                 }
             }
+            if !arm {
+                return Ok(bell);
+            }
             // Out of ring data (or space) with the socket still ready: ask the
             // agent for a doorbell, unless it raced us and there is work again.
             let mut again = false;
@@ -380,11 +394,20 @@ struct Stats {
     shm_rx_bytes: u64,
     bells_in: u64,
     bells_out: u64,
+    epoll_events: u64,
+    busy_polls: u64,
+}
+
+impl Stats {
+    /// Changes whenever a processing pass did something.
+    fn work(&self) -> u64 {
+        self.tx_pkts + self.rx_chains + self.shm_tx_bytes + self.shm_rx_bytes + self.epoll_events + self.bells_out
+    }
 }
 
 struct Dev {
     stats: Stats,
-    stats_at: Option<std::time::Instant>,
+    stats_at: Option<Instant>,
     cid: u64,
     aliases: Vec<IpAddr>,
     listen_port: u32,
@@ -402,6 +425,8 @@ struct Dev {
     tx_ready: HashSet<u64>,
     shm_ready: HashSet<u64>,
     shm: Option<ShmTable>,
+    busy_poll: Duration,
+    yield_fd: OwnedFd,
     segs: Vec<Seg>,
     iov: Vec<libc::iovec>,
 }
@@ -537,9 +562,15 @@ impl Dev {
         for (i, (l, _)) in forwards.iter().enumerate() {
             epoll_add(ep, l.as_raw_fd(), libc::EPOLLIN as u32, LISTENER_BIT | i as u64)?;
         }
+        let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if efd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let yield_fd = unsafe { OwnedFd::from_raw_fd(efd) };
+        epoll_add(ep, efd, libc::EPOLLIN as u32, YIELD_TOK)?;
         Ok(Dev {
             stats: Stats::default(),
-            stats_at: std::env::var_os("NETD_STATS").map(|_| std::time::Instant::now()),
+            stats_at: std::env::var_os("NETD_STATS").map(|_| Instant::now()),
             cid: cfg.cid,
             aliases: cfg.aliases.clone(),
             listen_port: cfg.listen_port,
@@ -557,6 +588,8 @@ impl Dev {
             tx_ready: HashSet::new(),
             shm_ready: HashSet::new(),
             shm: None,
+            busy_poll: cfg.busy_poll,
+            yield_fd,
             segs: Vec::with_capacity(512),
             iov: Vec::with_capacity(512),
         })
@@ -567,13 +600,51 @@ impl Dev {
         let guard = atomic.memory();
         let mem: &Mem = &guard;
         self.stats.wakeups += 1;
-        self.poll_epoll();
-        self.process_tx(&vrings[TXQ], mem)?;
-        self.flush_tx_ready();
-        self.pump_shm_ready();
-        self.process_rx(&vrings[RXQ], mem)?;
+        let start = Instant::now();
+        let mut last_work = start;
+        loop {
+            let before = self.stats.work();
+            self.poll_epoll();
+            self.process_tx(&vrings[TXQ], mem)?;
+            self.flush_tx_ready();
+            // While busy-polling, the rings are serviced without arming their
+            // wait flags, so the agent has no reason to ring the doorbell.
+            let busy = !self.busy_poll.is_zero() && self.conns.values().any(|c| c.shm.is_some());
+            let toks: Vec<u64> = if busy { self.shm_conns() } else { self.shm_ready.iter().copied().collect() };
+            self.shm_ready.clear();
+            self.pump_shm(toks, !busy);
+            self.process_rx(&vrings[RXQ], mem)?;
+            if !busy {
+                break;
+            }
+            self.stats.busy_polls += 1;
+            if self.stats.work() != before {
+                last_work = Instant::now();
+            }
+            if start.elapsed() >= MAX_POLL {
+                // Still busy: come back through the event loop.
+                unsafe { libc::eventfd_write(self.yield_fd.as_raw_fd(), 1) };
+                break;
+            }
+            if last_work.elapsed() >= self.busy_poll {
+                // Idle: arm the rings and sleep, unless arming found work.
+                let before = self.stats.work();
+                let toks = self.shm_conns();
+                self.pump_shm(toks, true);
+                self.process_rx(&vrings[RXQ], mem)?;
+                if self.stats.work() == before {
+                    break;
+                }
+                last_work = Instant::now();
+            }
+            std::hint::spin_loop();
+        }
         self.print_stats();
         Ok(())
+    }
+
+    fn shm_conns(&self) -> Vec<u64> {
+        self.conns.iter().filter(|(_, c)| c.shm.is_some()).map(|(&t, _)| t).collect()
     }
 
     fn print_stats(&mut self) {
@@ -585,7 +656,7 @@ impl Dev {
             eprintln!("netd: stats {:?} conns={}", self.stats, self.conns.len());
         }
         self.stats = Stats::default();
-        self.stats_at = Some(std::time::Instant::now());
+        self.stats_at = Some(Instant::now());
     }
 
     // ---- host sockets ----
@@ -597,8 +668,14 @@ impl Dev {
             if n <= 0 {
                 return;
             }
+            self.stats.epoll_events += n as u64;
             for e in &evs[..n as usize] {
                 let (ev, tok) = (e.events, e.u64);
+                if tok == YIELD_TOK {
+                    let mut v = 0;
+                    unsafe { libc::eventfd_read(self.yield_fd.as_raw_fd(), &mut v) };
+                    continue;
+                }
                 if tok & LISTENER_BIT != 0 {
                     self.accept_forward((tok & !LISTENER_BIT) as usize);
                     continue;
@@ -762,14 +839,13 @@ impl Dev {
         true
     }
 
-    fn pump_shm_ready(&mut self) {
-        let toks: Vec<u64> = self.shm_ready.drain().collect();
+    fn pump_shm(&mut self, toks: Vec<u64>, arm: bool) {
         for tok in toks {
             let Some(c) = self.conns.get_mut(&tok) else { continue };
             if c.state != State::Relay {
                 continue;
             }
-            match c.pump_shm(&mut self.stats) {
+            match c.pump_shm(&mut self.stats, arm) {
                 Ok(bell) => {
                     // One pending byte is enough to wake the agent.
                     if bell && !c.guest_shut_rcv && c.prefix.is_empty() {
@@ -1356,9 +1432,9 @@ impl VhostUserBackend for Backend {
 /// Serves the vhost-user socket forever; a new device is created for every
 /// frontend (QEMU) connection.
 pub fn serve(socket: &str, cfg: Config) -> ! {
-    let Config { cid, aliases, listen_port, guest_port, forwards } = cfg;
+    let Config { cid, aliases, listen_port, guest_port, forwards, busy_poll } = cfg;
     let forwards = Arc::new(forwards);
-    let cfg = Config { cid, aliases, listen_port, guest_port, forwards: Vec::new() };
+    let cfg = Config { cid, aliases, listen_port, guest_port, forwards: Vec::new(), busy_poll };
     loop {
         if let Err(e) = serve_once(socket, &cfg, forwards.clone()) {
             eprintln!("netd: vhost-user: {e}");

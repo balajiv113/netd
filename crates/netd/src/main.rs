@@ -36,7 +36,9 @@ const USAGE: &str = "usage: netd [options]
   --forward ADDR=PORT      forward host TCP ADDR (e.g. 127.0.0.1:8080) to guest port PORT
   --host-alias IP          guest-visible address that maps to host loopback (repeatable;
                            default 192.168.5.2 and fd00:5::2)
-  --vsock-buf BYTES        vsock credit window for AF_VSOCK sockets (default 4194304)";
+  --vsock-buf BYTES        vsock credit window for AF_VSOCK sockets (default 4194304)
+  --busy-poll-us US        with --vhost-user: keep polling active shared rings this long
+                           before sleeping (default 50, 0 = event driven only)";
 
 enum GuestPath {
     Uds(String),
@@ -53,6 +55,7 @@ struct Config {
     forwards: Vec<(SocketAddr, u16)>,
     aliases: Vec<IpAddr>,
     vsock_buf: u64,
+    busy_poll_us: u64,
 }
 
 fn die(m: &str) -> ! {
@@ -75,6 +78,7 @@ fn parse_args() -> Config {
         forwards: vec![],
         aliases: vec![],
         vsock_buf: 4 << 20,
+        busy_poll_us: 50,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -97,6 +101,7 @@ fn parse_args() -> Config {
             }
             "--host-alias" => c.aliases.push(parse(&v, "alias")),
             "--vsock-buf" => c.vsock_buf = parse(&v, "size"),
+            "--busy-poll-us" => c.busy_poll_us = parse(&v, "microseconds"),
             _ => die(&format!("unknown option {a}")),
         }
     }
@@ -231,6 +236,7 @@ fn run_vhost_user(path: &str, cfg: &Config) -> ! {
             listen_port: 1024,
             guest_port: cfg.guest_port,
             forwards,
+            busy_poll: std::time::Duration::from_micros(cfg.busy_poll_us),
         },
     )
 }

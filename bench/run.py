@@ -318,6 +318,12 @@ class PasstVU(Passt):
     vhost_user = True
 
 
+def variant_args(variant, i):
+    """netd@AGENT_ARGS@NETD_ARGS: part i, comma-separated."""
+    parts = variant.split("@")
+    return [a for a in parts[i].split(",") if a] if i < len(parts) else []
+
+
 NETD_GUEST_SETUP = """
 set -e
 modprobe vmw_vsock_virtio_transport 2>/dev/null || true
@@ -341,7 +347,7 @@ class Netd(Contender):
     def start_backend(self):
         (W / "netd-vu.sock").unlink(missing_ok=True)
         self.spawn([BIN / "netd", "--vhost-user", f"{W}/netd-vu.sock", "--guest-cid", "3",
-                    "--forward", f"127.0.0.1:{FWD_HOST_PORT}={GUEST_IPERF_PORT}"], "netd",
+                    "--forward", f"127.0.0.1:{FWD_HOST_PORT}={GUEST_IPERF_PORT}"] + variant_args(self.variant, 1), "netd",
                    env={"NETD_STATS": "1"})
         wait_path(W / "netd-vu.sock")
 
@@ -349,7 +355,7 @@ class Netd(Contender):
         return ["-chardev", f"socket,id=c1,path={W}/netd-vu.sock", "-device", "vhost-user-vsock-pci,chardev=c1"]
 
     def guest_setup(self, g):
-        g.run(NETD_GUEST_SETUP.format(agent_args=shlex.join(self.variant.split(",")) if self.variant else ""))
+        g.run(NETD_GUEST_SETUP.format(agent_args=shlex.join(variant_args(self.variant, 0))))
 
     def setup_forward(self, g):
         return "127.0.0.1", FWD_HOST_PORT
@@ -429,7 +435,8 @@ def run_native(args):
 
 def run_contender(name, args):
     procs = []
-    # "netd@--spin-us,0" runs netd with extra (comma-separated) agent arguments.
+    # "netd@--spin-us,0@--busy-poll-us,0" adds (comma-separated) netd-agent
+    # and netd arguments.
     base, _, variant = name.partition("@")
     c = CLASSES[base](procs, variant)
     tag = re.sub(r"[^A-Za-z0-9_.-]", "_", name)  # QEMU options split on commas
@@ -561,7 +568,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("contenders", nargs="*", default=NETD,
                     help="default: netd only; other contenders come from the frozen baseline ('all' = rerun everything); "
-                         "netd@ARG,ARG... adds netd-agent arguments")
+                         "netd@AGENT_ARGS@NETD_ARGS (comma-separated) adds netd-agent / netd arguments")
     ap.add_argument("--baseline", default=str(BASELINE), help="frozen results merged into the report ('' = none)")
     ap.add_argument("--secs", type=int, default=10)
     ap.add_argument("--vcpus", type=int, default=2)

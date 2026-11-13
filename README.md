@@ -33,6 +33,11 @@ other side has announced that it is about to sleep. netd validates every ring
 position, so a misbehaving guest can only corrupt its own connections.
 Connections without a free slot fall back to payload over vsock.
 
+Doorbells cost a guest kernel round trip, a VM exit and an interrupt, so both
+sides poll briefly before arming them: netd's worker keeps servicing active
+rings for `--busy-poll-us` (default 50) after the last work, like vhost-net's
+busyloop, and the agent spins for `--spin-us` (default 50) before sleeping.
+
 ## Crates
 
 | crate | purpose |
