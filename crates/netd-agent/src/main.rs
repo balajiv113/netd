@@ -14,6 +14,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::exit;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use netd_common::proto::{self, PROTO_TCP, Request};
@@ -26,7 +27,9 @@ const USAGE: &str = "usage: netd-agent [options]
   --inbound-vsock PORT   vsock port for host port forwards (default 1025, 0 = off)
   --inbound-unix PATH    Unix socket for host port forwards (testing)
   --fixed-dst ADDR       destination to use when SO_ORIGINAL_DST is unavailable (testing)
-  --vsock-buf BYTES      vsock credit window (default 4194304)";
+  --vsock-buf BYTES      vsock credit window (default 4194304)
+  --splice-to-vsock 0|1  splice guest TCP -> vsock (default 0: multi-descriptor
+                         packets break some vhost-user-vsock backends)";
 
 #[derive(Clone)]
 enum Upstream {
@@ -42,6 +45,8 @@ struct Config {
     fixed_dst: Option<SocketAddr>,
     vsock_buf: u64,
 }
+
+static SPLICE_TO_VSOCK: AtomicBool = AtomicBool::new(false);
 
 fn die(m: &str) -> ! {
     eprintln!("netd-agent: {m}\n{USAGE}");
@@ -79,6 +84,7 @@ fn parse_args() -> Config {
             "--inbound-unix" => c.inbound_unix = Some(v),
             "--fixed-dst" => c.fixed_dst = Some(parse(&v, "address")),
             "--vsock-buf" => c.vsock_buf = parse(&v, "size"),
+            "--splice-to-vsock" => SPLICE_TO_VSOCK.store(v == "1", Ordering::Relaxed),
             _ => die(&format!("unknown option {a}")),
         }
     }
@@ -128,7 +134,7 @@ fn serve_outbound(tcp: TcpStream, cfg: &Config) -> io::Result<()> {
         // Close the guest connection; the app sees a reset/EOF.
         return Err(io::Error::from_raw_os_error(st));
     }
-    relay::relay(tcp.into(), up.into());
+    relay::relay_dirs(tcp.into(), up.into(), SPLICE_TO_VSOCK.load(Ordering::Relaxed), true);
     Ok(())
 }
 
@@ -144,7 +150,7 @@ fn serve_inbound(conn: OwnedFd) -> io::Result<()> {
     };
     tcp.set_nodelay(true)?;
     proto::write_status(&mut f, 0)?;
-    relay::relay(f.into(), tcp.into());
+    relay::relay_dirs(f.into(), tcp.into(), true, SPLICE_TO_VSOCK.load(Ordering::Relaxed));
     Ok(())
 }
 

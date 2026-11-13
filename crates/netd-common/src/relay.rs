@@ -106,9 +106,11 @@ fn pump_copy(src: RawFd, dst: RawFd) -> io::Result<u64> {
     }
 }
 
-/// Copy everything from `src` to `dst` until EOF.
-pub fn pump(src: RawFd, dst: RawFd) -> io::Result<u64> {
-    if std::env::var_os("NETD_NO_SPLICE").is_none()
+/// Copy everything from `src` to `dst` until EOF. `splice` selects the
+/// zero-copy path when the descriptors support it.
+pub fn pump(src: RawFd, dst: RawFd, splice: bool) -> io::Result<u64> {
+    if splice
+        && std::env::var_os("NETD_NO_SPLICE").is_none()
         && let Some(n) = pump_splice(src, dst)?
     {
         return Ok(n);
@@ -134,14 +136,22 @@ fn finish(src: RawFd, dst: RawFd, r: io::Result<u64>) {
 /// Relay bytes between `a` and `b` in both directions until both sides are
 /// done. Blocks the calling thread; one extra thread is used.
 pub fn relay(a: OwnedFd, b: OwnedFd) {
+    relay_dirs(a, b, true, true);
+}
+
+/// Like [`relay`], choosing splice per direction. Splicing into a guest
+/// AF_VSOCK socket makes the kernel emit multi-descriptor (non-linear) packets,
+/// which some vhost-user-vsock backends cannot parse; such directions should
+/// use plain writes.
+pub fn relay_dirs(a: OwnedFd, b: OwnedFd, splice_ab: bool, splice_ba: bool) {
     let a = Arc::new(a);
     let b = Arc::new(b);
     let (a2, b2) = (a.clone(), b.clone());
     let t = thread::spawn(move || {
-        let r = pump(a2.as_raw_fd(), b2.as_raw_fd());
+        let r = pump(a2.as_raw_fd(), b2.as_raw_fd(), splice_ab);
         finish(a2.as_raw_fd(), b2.as_raw_fd(), r);
     });
-    let r = pump(b.as_raw_fd(), a.as_raw_fd());
+    let r = pump(b.as_raw_fd(), a.as_raw_fd(), splice_ba);
     finish(b.as_raw_fd(), a.as_raw_fd(), r);
     let _ = t.join();
 }
