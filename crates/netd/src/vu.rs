@@ -312,8 +312,9 @@ impl Conn {
         self.peer_buf_alloc.saturating_sub(inflight) as usize
     }
 
-    fn poll_eligible(&self, now: Instant, budget: Duration) -> bool {
-        self.shm.is_some() && !self.bulk && now.duration_since(self.last_activity) < budget
+    fn poll_eligible(&self, now: Instant, budget: Duration, bulk_present: bool) -> bool {
+        self.shm.is_some() && !self.bulk && !budget.is_zero()
+            && (!bulk_present || now.duration_since(self.last_activity) < budget)
     }
 
     /// Moves payload between the host socket and the shared rings until
@@ -671,16 +672,14 @@ impl Dev {
             self.flush_tx_ready();
             // While busy-polling, the rings are serviced without arming their
             // wait flags, so the agent has no reason to ring the doorbell.
-            let now = Instant::now();
-            let busy = self.conns.values().any(|c| c.poll_eligible(now, self.busy_poll));
+            let busy = self.should_poll();
             let toks: Vec<u64> = if busy || self.polling { self.shm_conns() } else { self.shm_ready.iter().copied().collect() };
             self.shm_ready.clear();
             self.pump_shm(toks, !busy);
             self.process_rx(&vrings[RXQ], mem)?;
             if !busy {
                 self.polling = false;
-                let now = Instant::now();
-                if self.shm_ready.is_empty() && !self.conns.values().any(|c| c.poll_eligible(now, self.busy_poll)) {
+                if self.shm_ready.is_empty() && !self.should_poll() {
                     break;
                 }
                 continue;
@@ -715,6 +714,12 @@ impl Dev {
 
     fn shm_conns(&self) -> Vec<u64> {
         self.conns.iter().filter(|(_, c)| c.shm.is_some()).map(|(&t, _)| t).collect()
+    }
+
+    fn should_poll(&self) -> bool {
+        let bulk_present = self.conns.values().any(|c| c.shm.is_some() && c.bulk);
+        let now = Instant::now();
+        self.conns.values().any(|c| c.poll_eligible(now, self.busy_poll, bulk_present))
     }
 
     fn print_stats(&mut self) {
@@ -1747,11 +1752,12 @@ mod tests {
         let now = Instant::now();
         let budget = Duration::from_micros(50);
         c.last_activity = now - budget;
-        assert!(!c.poll_eligible(now, budget));
+        assert!(!c.poll_eligible(now, budget, true));
+        assert!(c.poll_eligible(now, budget, false));
         c.last_activity = now;
-        assert!(c.poll_eligible(now, budget));
-        assert!(!c.poll_eligible(now, Duration::ZERO));
+        assert!(c.poll_eligible(now, budget, true));
+        assert!(!c.poll_eligible(now, Duration::ZERO, false));
         c.bulk = true;
-        assert!(!c.poll_eligible(now, budget));
+        assert!(!c.poll_eligible(now, budget, true));
     }
 }
