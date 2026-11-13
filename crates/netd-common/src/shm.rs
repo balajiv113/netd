@@ -27,7 +27,7 @@ pub const HUGEPAGE: usize = 2 << 20;
 pub const RING_SIZE: usize = HUGEPAGE;
 /// Largest guest-to-host transfer between ring updates. Committing in pieces
 /// lets the peer work concurrently instead of waiting for a whole ring.
-pub const CHUNK: usize = RING_SIZE / 8;
+pub const CHUNK: usize = RING_SIZE / 4;
 /// Larger batches amortize host socket reads during host-to-guest transfers.
 pub const HOST_TO_GUEST_CHUNK: usize = RING_SIZE / 4;
 /// A waiting producer is only woken once this much space is free, so a full
