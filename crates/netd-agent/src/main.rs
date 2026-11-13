@@ -6,6 +6,11 @@
 //!
 //! Inbound: netd connects to the agent's vsock port for host port forwards;
 //! the agent connects to the requested guest-local port.
+//!
+//! With netd's vhost-user device, connections carry their payload through
+//! shared rings in guest hugepages (see `shm`) instead of the vsock stream.
+
+mod shm;
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -17,16 +22,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use netd_common::proto::{self, PROTO_TCP, Request};
+use netd_common::proto::{self, Msg, PROTO_TCP, Request};
+use netd_common::shm::{MAX_SLOTS, NO_SLOT};
 use netd_common::{relay, sock};
 
 const USAGE: &str = "usage: netd-agent [options]
-  --listen ADDR          redirect target for outbound TCP (default 0.0.0.0:15001)
+  --listen ADDR          redirect target for outbound TCP (default 0.0.0.0:15001);
+                         may be repeated
   --vsock CID:PORT       netd endpoint (default 2:1024)
   --unix PATH            use a Unix socket instead of vsock (testing)
   --inbound-vsock PORT   vsock port for host port forwards (default 1025, 0 = off)
   --inbound-unix PATH    Unix socket for host port forwards (testing)
-  --fixed-dst ADDR       destination to use when SO_ORIGINAL_DST is unavailable (testing)
+  --fixed-dst ADDR       destination for the preceding --listen instead of
+                         SO_ORIGINAL_DST (testing)
+  --shm-slots N          shared-ring slots, i.e. concurrent connections using
+                         shared memory (default 16, 0 = off)
   --vsock-buf BYTES      vsock credit window (default 4194304)
   --splice-to-vsock 0|1  splice guest TCP -> vsock (default 1; 0 = plain writes)";
 
@@ -36,13 +46,19 @@ enum Upstream {
     Unix(String),
 }
 
+struct Listen {
+    addr: SocketAddr,
+    fixed_dst: Option<SocketAddr>,
+}
+
 struct Config {
-    listen: SocketAddr,
+    listens: Vec<Listen>,
     upstream: Upstream,
     inbound_vsock: u32,
     inbound_unix: Option<String>,
-    fixed_dst: Option<SocketAddr>,
     vsock_buf: u64,
+    shm_slots: usize,
+    region: Option<Arc<shm::Region>>,
 }
 
 static SPLICE_TO_VSOCK: AtomicBool = AtomicBool::new(true);
@@ -58,12 +74,13 @@ fn parse<T: std::str::FromStr>(v: &str, what: &str) -> T {
 
 fn parse_args() -> Config {
     let mut c = Config {
-        listen: "0.0.0.0:15001".parse().unwrap(),
+        listens: Vec::new(),
         upstream: Upstream::Vsock(sock::VMADDR_CID_HOST, 1024),
         inbound_vsock: 1025,
         inbound_unix: None,
-        fixed_dst: None,
         vsock_buf: 4 << 20,
+        shm_slots: 16,
+        region: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -73,7 +90,7 @@ fn parse_args() -> Config {
         }
         let v = args.next().unwrap_or_else(|| die(&format!("{a} needs a value")));
         match a.as_str() {
-            "--listen" => c.listen = parse(&v, "address"),
+            "--listen" => c.listens.push(Listen { addr: parse(&v, "address"), fixed_dst: None }),
             "--vsock" => {
                 let (cid, port) = v.split_once(':').unwrap_or_else(|| die("--vsock wants CID:PORT"));
                 c.upstream = Upstream::Vsock(parse(cid, "cid"), parse(port, "port"));
@@ -81,11 +98,23 @@ fn parse_args() -> Config {
             "--unix" => c.upstream = Upstream::Unix(v),
             "--inbound-vsock" => c.inbound_vsock = parse(&v, "port"),
             "--inbound-unix" => c.inbound_unix = Some(v),
-            "--fixed-dst" => c.fixed_dst = Some(parse(&v, "address")),
+            "--fixed-dst" => {
+                let l = c.listens.last_mut().unwrap_or_else(|| die("--fixed-dst must follow a --listen"));
+                l.fixed_dst = Some(parse(&v, "address"));
+            }
+            "--shm-slots" => {
+                c.shm_slots = parse(&v, "slot count");
+                if c.shm_slots > MAX_SLOTS {
+                    die(&format!("--shm-slots is at most {MAX_SLOTS}"));
+                }
+            }
             "--vsock-buf" => c.vsock_buf = parse(&v, "size"),
             "--splice-to-vsock" => SPLICE_TO_VSOCK.store(v == "1", Ordering::Relaxed),
             _ => die(&format!("unknown option {a}")),
         }
+    }
+    if c.listens.is_empty() {
+        c.listens.push(Listen { addr: "0.0.0.0:15001".parse().unwrap(), fixed_dst: None });
     }
     c
 }
@@ -120,40 +149,57 @@ fn connect_upstream(u: &Upstream, vsock_buf: u64) -> io::Result<OwnedFd> {
     }
 }
 
-fn serve_outbound(tcp: TcpStream, cfg: &Config) -> io::Result<()> {
+fn serve_outbound(tcp: TcpStream, fixed_dst: Option<SocketAddr>, cfg: &Config) -> io::Result<()> {
     tcp.set_nodelay(true)?;
-    let dst = match cfg.fixed_dst {
+    let dst = match fixed_dst {
         Some(d) => d,
         None => original_dst(tcp.as_raw_fd(), tcp.local_addr()?.is_ipv6())?,
     };
     let mut up = File::from(connect_upstream(&cfg.upstream, cfg.vsock_buf)?);
-    up.write_all(&Request::tcp(dst).encode())?;
-    let st = proto::read_status(&mut up)?;
+    let (slot, idx) = shm::offer(&cfg.region);
+    up.write_all(&Request::tcp(dst, idx).encode())?;
+    let (st, got) = proto::read_status(&mut up)?;
+    match slot {
+        Some(s) if st == 0 && got == idx => return shm::relay(tcp.into(), up.into(), s),
+        Some(s) => s.give_back(),
+        None => {}
+    }
     if st != 0 {
         // Close the guest connection; the app sees a reset/EOF.
         return Err(io::Error::from_raw_os_error(st));
+    }
+    if got != NO_SLOT {
+        return Err(io::Error::other("netd assigned a slot that was not offered"));
     }
     relay::relay_dirs(tcp.into(), up.into(), SPLICE_TO_VSOCK.load(Ordering::Relaxed), true);
     Ok(())
 }
 
-fn serve_inbound(conn: OwnedFd) -> io::Result<()> {
+fn serve_inbound(conn: OwnedFd, region: &Option<Arc<shm::Region>>) -> io::Result<()> {
     let mut f = File::from(conn);
-    let req = Request::read_from(&mut f)?;
-    if req.proto != PROTO_TCP || !req.dst.ip().is_loopback() {
-        return proto::write_status(&mut f, libc::EPERM);
-    }
+    let req = match Msg::read_from(&mut f)? {
+        Msg::Connect(r) if r.proto == PROTO_TCP && r.dst.ip().is_loopback() => r,
+        _ => return proto::write_error(&mut f, libc::EPERM),
+    };
     let tcp = match TcpStream::connect(req.dst) {
         Ok(t) => t,
-        Err(e) => return proto::write_status(&mut f, e.raw_os_error().unwrap_or(libc::ECONNREFUSED)),
+        Err(e) => return proto::write_error(&mut f, e.raw_os_error().unwrap_or(libc::ECONNREFUSED)),
     };
     tcp.set_nodelay(true)?;
-    proto::write_status(&mut f, 0)?;
-    relay::relay_dirs(f.into(), tcp.into(), true, SPLICE_TO_VSOCK.load(Ordering::Relaxed));
-    Ok(())
+    // Only netd's vhost-user device can use the rings; it marks that by
+    // leaving the slot choice to the agent (thread mode never sees a slot).
+    let (slot, idx) = shm::offer(region);
+    proto::write_status(&mut f, 0, idx)?;
+    match slot {
+        Some(s) => shm::relay(tcp.into(), f.into(), s),
+        None => {
+            relay::relay_dirs(f.into(), tcp.into(), true, SPLICE_TO_VSOCK.load(Ordering::Relaxed));
+            Ok(())
+        }
+    }
 }
 
-fn spawn_inbound(listener: OwnedFd, vsock_buf: Option<u64>) {
+fn spawn_inbound(listener: OwnedFd, vsock_buf: Option<u64>, region: Option<Arc<shm::Region>>) {
     thread::spawn(move || {
         loop {
             match sock::accept(listener.as_raw_fd()) {
@@ -161,8 +207,9 @@ fn spawn_inbound(listener: OwnedFd, vsock_buf: Option<u64>) {
                     if let Some(b) = vsock_buf {
                         let _ = sock::set_vsock_buffer(c.as_raw_fd(), b);
                     }
+                    let region = region.clone();
                     thread::spawn(move || {
-                        if let Err(e) = serve_inbound(c) {
+                        if let Err(e) = serve_inbound(c, &region) {
                             eprintln!("netd-agent: inbound: {e}");
                         }
                     });
@@ -174,32 +221,61 @@ fn spawn_inbound(listener: OwnedFd, vsock_buf: Option<u64>) {
 }
 
 fn main() {
-    let cfg = Arc::new(parse_args());
+    let mut cfg = parse_args();
+
+    if cfg.shm_slots > 0 {
+        match shm::Region::new(cfg.shm_slots) {
+            Ok(r) => {
+                let r = Arc::new(r);
+                let (up, buf) = (cfg.upstream.clone(), cfg.vsock_buf);
+                r.register(move || connect_upstream(&up, buf));
+                cfg.region = Some(r);
+            }
+            Err(e) => eprintln!("netd-agent: shared rings unavailable: {e}"),
+        }
+    }
 
     if let Some(p) = &cfg.inbound_unix {
         let _ = std::fs::remove_file(p);
         let l = UnixListener::bind(p).unwrap_or_else(|e| die(&format!("bind {p}: {e}")));
-        spawn_inbound(l.into(), None);
+        spawn_inbound(l.into(), None, cfg.region.clone());
     } else if cfg.inbound_vsock != 0 {
         match sock::vsock_listen(cfg.inbound_vsock) {
-            Ok(l) => spawn_inbound(l, Some(cfg.vsock_buf)),
+            Ok(l) => spawn_inbound(l, Some(cfg.vsock_buf), cfg.region.clone()),
             Err(e) => eprintln!("netd-agent: inbound vsock {}: {e} (port forwards disabled)", cfg.inbound_vsock),
         }
     }
 
-    let l = TcpListener::bind(cfg.listen).unwrap_or_else(|e| die(&format!("bind {}: {e}", cfg.listen)));
-    eprintln!("netd-agent: redirect target {}", cfg.listen);
-    for c in l.incoming() {
-        match c {
-            Ok(t) => {
-                let cfg = cfg.clone();
-                thread::spawn(move || {
-                    if let Err(e) = serve_outbound(t, &cfg) {
-                        eprintln!("netd-agent: outbound: {e}");
+    let listeners: Vec<(TcpListener, Option<SocketAddr>)> = cfg
+        .listens
+        .iter()
+        .map(|l| {
+            let t = TcpListener::bind(l.addr).unwrap_or_else(|e| die(&format!("bind {}: {e}", l.addr)));
+            eprintln!("netd-agent: redirect target {}", l.addr);
+            (t, l.fixed_dst)
+        })
+        .collect();
+    let cfg = Arc::new(cfg);
+    let mut handles = Vec::new();
+    for (l, fixed_dst) in listeners {
+        let cfg = cfg.clone();
+        handles.push(thread::spawn(move || {
+            for c in l.incoming() {
+                match c {
+                    Ok(t) => {
+                        let cfg = cfg.clone();
+                        thread::spawn(move || {
+                            if let Err(e) = serve_outbound(t, fixed_dst, &cfg) {
+                                eprintln!("netd-agent: outbound: {e}");
+                            }
+                        });
                     }
-                });
+                    Err(e) => eprintln!("netd-agent: accept: {e}"),
+                }
             }
-            Err(e) => eprintln!("netd-agent: accept: {e}"),
-        }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
     }
 }

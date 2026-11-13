@@ -20,7 +20,8 @@ use std::process::exit;
 use std::sync::Arc;
 use std::thread;
 
-use netd_common::proto::{self, PROTO_TCP, Request};
+use netd_common::proto::{self, Msg, PROTO_TCP, Request};
+use netd_common::shm::NO_SLOT;
 use netd_common::{relay, sock};
 
 const USAGE: &str = "usage: netd [options]
@@ -131,16 +132,18 @@ pub(crate) fn map_dst(aliases: &[IpAddr], dst: SocketAddr) -> SocketAddr {
 /// Serve one guest-initiated connection: read the request, connect, relay.
 fn serve_outbound(conn: OwnedFd, aliases: &[IpAddr]) -> io::Result<()> {
     let mut f = File::from(conn);
-    let req = Request::read_from(&mut f)?;
-    if req.proto != PROTO_TCP {
-        return proto::write_status(&mut f, libc::EPROTONOSUPPORT);
-    }
+    // Shared-memory rings need guest memory access, which only the
+    // vhost-user mode has; payload always goes over the stream here.
+    let req = match Msg::read_from(&mut f)? {
+        Msg::Connect(r) if r.proto == PROTO_TCP => r,
+        _ => return proto::write_error(&mut f, libc::EPROTONOSUPPORT),
+    };
     let tcp = match TcpStream::connect(map_dst(aliases, req.dst)) {
         Ok(t) => t,
-        Err(e) => return proto::write_status(&mut f, e.raw_os_error().unwrap_or(libc::ECONNREFUSED)),
+        Err(e) => return proto::write_error(&mut f, e.raw_os_error().unwrap_or(libc::ECONNREFUSED)),
     };
     tcp.set_nodelay(true)?;
-    proto::write_status(&mut f, 0)?;
+    proto::write_status(&mut f, 0, NO_SLOT)?;
     relay::relay(f.into(), tcp.into());
     Ok(())
 }
@@ -174,10 +177,11 @@ fn serve_forward(tcp: TcpStream, cfg: &Config, guest_port: u16) -> io::Result<()
     let g = cfg.guest.as_ref().expect("checked in parse_args");
     let mut f = File::from(connect_guest(g, cfg.guest_port, cfg.vsock_buf)?);
     let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), guest_port);
-    f.write_all(&Request::tcp(dst).encode())?;
-    let st = proto::read_status(&mut f)?;
-    if st != 0 {
-        return Err(io::Error::from_raw_os_error(st));
+    f.write_all(&Request::tcp(dst, NO_SLOT).encode())?;
+    match proto::read_status(&mut f)? {
+        (0, NO_SLOT) => {}
+        (0, _) => return Err(io::Error::new(io::ErrorKind::InvalidData, "guest picked a shared-memory slot")),
+        (e, _) => return Err(io::Error::from_raw_os_error(e)),
     }
     relay::relay(f.into(), tcp.into());
     Ok(())

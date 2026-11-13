@@ -36,12 +36,11 @@ mount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev
 for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do insmod /mod/$m.ko; done
 ip link set lo up
 EXTRA=$(grep -o 'agent=[^ ]*' /proc/cmdline | cut -d= -f2- | tr , ' ')
-netd-agent --fixed-dst 192.168.5.2:5201 --listen 127.0.0.1:15001 $EXTRA 2>/tmp/agent.log &
+netd-agent --listen 127.0.0.1:15001 --fixed-dst 192.168.5.2:5201 \
+  --listen 127.0.0.1:15002 --fixed-dst 192.168.5.2:7000 $EXTRA 2>/tmp/agent.log &
 sleep 1
 echo "VMTEST: up";   iperf3 -c 127.0.0.1 -p 15001 -t 5 -O 1 --connect-timeout 5000 2>&1 | grep -E "receiver|error"
 echo "VMTEST: down"; iperf3 -c 127.0.0.1 -p 15001 -t 5 -O 1 -R --connect-timeout 5000 2>&1 | grep -E "receiver|error"
-netd-agent --fixed-dst 192.168.5.2:7000 --listen 127.0.0.1:15002 --inbound-vsock 0 $EXTRA 2>>/tmp/agent.log &
-sleep 1
 echo "VMTEST: rr $(nbench rr 127.0.0.1:15002 2000 2>&1)"
 echo "VMTEST: crr $(nbench crr 127.0.0.1:15002 3 2>&1)"
 iperf3 -s -1 -p 5301 >/dev/null 2>&1 & S=$!
@@ -59,7 +58,7 @@ cleanup() { kill "${PIDS[@]}" 2>/dev/null || true; }
 trap cleanup EXIT
 iperf3 -s -p 5201 >$W/iperf.log 2>&1 & PIDS+=($!)
 $N/nbench server 127.0.0.1:7000 >$W/nb.log 2>&1 & PIDS+=($!)
-$N/netd --vhost-user $W/vu.sock --guest-cid 3 --forward 127.0.0.1:15301=5301 >$W/netd.log 2>&1 & PIDS+=($!)
+NETD_STATS=1 $N/netd --vhost-user $W/vu.sock --guest-cid 3 --forward 127.0.0.1:15301=5301 >$W/netd.log 2>&1 & PIDS+=($!)
 for _ in $(seq 50); do [ -S $W/vu.sock ] && break; sleep 0.1; done
 ACCEL=tcg; [ -w /dev/kvm ] && ACCEL=kvm
 timeout 300 qemu-system-x86_64 -machine q35 -accel $ACCEL -smp 2 -m 1024 -nodefaults -display none \
@@ -75,7 +74,11 @@ if grep -q 'VMTEST: fwd-ready' $W/console.log; then
 fi
 wait $Q || true
 { sed -n '/VMTEST: up/,/VMTEST: DONE/p' $W/console.log | grep -Ev '^\[ *[0-9]+\.[0-9]+\]' | grep -v fwd-ready
-  echo "VMTEST: fwd (host -> guest)"; cat $W/fwd.txt 2>/dev/null; cat $W/fds.txt 2>/dev/null; } | tee $W/out.txt
+  echo "VMTEST: fwd (host -> guest)"; cat $W/fwd.txt 2>/dev/null; cat $W/fds.txt 2>/dev/null
+  grep -v '^netd: stats' $W/netd.log; grep -E 'shm_(tx|rx)_bytes: [1-9]' $W/netd.log | tail -2; } | tee $W/out.txt
 echo "logs: $W"
-# Fail if any direction moved no data.
-grep -q "\"errors\":0" $W/out.txt && [ "$(grep -A1 -E 'VMTEST: (up|down|fwd)' $W/out.txt | grep -c ' [1-9][0-9.]* [MG]bits/sec')" -eq 3 ] && echo "VMTEST: PASS" || { echo "VMTEST: FAIL"; exit 1; }
+# Fail if any direction moved no data, or the shared rings were not used
+# (unless the agent was told not to use them).
+SHM_OK=1
+case "$EXTRA" in *shm-slots,0*) ;; *) grep -q 'shared rings registered' $W/out.txt && grep -qE 'shm_(tx|rx)_bytes: [1-9]' $W/out.txt || SHM_OK=0 ;; esac
+[ $SHM_OK = 1 ] && grep -q "\"errors\":0" $W/out.txt && [ "$(grep -A1 -E 'VMTEST: (up|down|fwd)' $W/out.txt | grep -c ' [1-9][0-9.]* [MG]bits/sec')" -eq 3 ] && echo "VMTEST: PASS" || { echo "VMTEST: FAIL"; exit 1; }

@@ -19,6 +19,20 @@ guest app ──TCP──▶ iptables REDIRECT ──▶ netd-agent ──AF_VSO
 * QEMU: `-chardev socket,id=c1,path=SOCK -device vhost-user-vsock-pci,chardev=c1`
   with shared guest memory; netd: `--vhost-user SOCK --guest-cid 3`.
 
+### Shared-memory data path
+
+As the vhost-user backend, netd already maps all guest RAM. The agent
+allocates hugepages (pinned, physically contiguous), looks up their
+guest-physical addresses in `/proc/self/pagemap` and registers them with netd
+over vsock (`--shm-slots N`, default 16; 0 = off). Each offloaded connection
+that gets a slot then moves its payload through two lock-free byte rings
+(guest→host and host→guest, 2 MiB each, `netd_common::shm`); netd reads and
+writes the host socket directly from/to guest memory. The connection's vsock
+stream only carries the handshake and one-byte doorbells, sent only when the
+other side has announced that it is about to sleep. netd validates every ring
+position, so a misbehaving guest can only corrupt its own connections.
+Connections without a free slot fall back to payload over vsock.
+
 ## Crates
 
 | crate | purpose |

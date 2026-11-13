@@ -9,6 +9,11 @@
 //!
 //! This removes the separate vhost-device-vsock process, its Unix socket hop
 //! and its per-packet copies. Everything runs on the backend's worker thread.
+//!
+//! When the agent has registered shared rings (netd_common::shm), connections
+//! that hold a slot bypass vsock packets entirely: netd moves payload between
+//! the host socket and the rings in guest memory, and the vsock stream only
+//! carries the handshake and one-byte doorbells.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -16,14 +21,15 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 
-use netd_common::proto::{PROTO_TCP, Request};
+use netd_common::proto::{self, Msg, PROTO_TCP, Request, STATUS_LEN, ShmRegion};
+use netd_common::shm::{Consumer, NO_SLOT, Producer, RING_SIZE, Ring, SLOT_CTL, SlotCtl};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringRwLock, VringState, VringT};
 use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_queue::desc::split::Descriptor;
 use virtio_queue::{QueueOwnedT, QueueT};
-use vm_memory::{GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend, GuestMemoryMmap};
+use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend, GuestMemoryMmap};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::event::{EventConsumer, EventFlag, EventNotifier, new_event_consumer_and_notifier};
 
@@ -180,6 +186,25 @@ enum State {
     Relay,
     /// Setup failed; waiting for the guest to close after it read the status.
     Failed,
+    /// The agent's shared-ring registration stream; carries no payload.
+    Registration,
+}
+
+/// The agent's registered rings. The memory snapshot keeps the mappings
+/// alive; the pointers are validated against it at registration.
+struct ShmTable {
+    _mem: Arc<Mem>,
+    ctl: *mut u8,
+    rings: Vec<*mut u8>,
+    in_use: Vec<bool>,
+}
+
+/// A connection's rings: netd consumes guest->host and produces host->guest.
+struct ShmConn {
+    slot: u16,
+    ctl: *const SlotCtl,
+    tx: Consumer,
+    rx: Producer,
 }
 
 struct Conn {
@@ -208,6 +233,9 @@ struct Conn {
     wr_shut: bool,
     guest_shut_send: bool,
     guest_shut_rcv: bool,
+    /// Slot the agent asked for in its request.
+    want_slot: u16,
+    shm: Option<ShmConn>,
 }
 
 impl Conn {
@@ -233,12 +261,86 @@ impl Conn {
             wr_shut: false,
             guest_shut_send: false,
             guest_shut_rcv: false,
+            want_slot: NO_SLOT,
+            shm: None,
         }
     }
 
     fn peer_credit(&self) -> usize {
         let inflight = self.tx_cnt.wrapping_sub(self.peer_fwd_cnt);
         self.peer_buf_alloc.saturating_sub(inflight) as usize
+    }
+
+    /// Moves payload between the host socket and the shared rings until
+    /// both directions block. Returns true if the agent must be woken.
+    fn pump_shm(&mut self, stats: &mut Stats) -> io::Result<bool> {
+        let Some(s) = self.shm.as_mut() else { return Ok(false) };
+        let fd = self.sock.as_ref().unwrap().as_raw_fd();
+        let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+        let mut bell = false;
+        loop {
+            while self.writable && !self.wr_shut {
+                let (k, n) = s.tx.data_iov(&mut iov)?;
+                if n == 0 {
+                    if s.tx.finished()? {
+                        unsafe { libc::shutdown(fd, libc::SHUT_WR) };
+                        self.wr_shut = true;
+                    }
+                    break;
+                }
+                let w = unsafe { libc::writev(fd, iov.as_ptr(), k as i32) };
+                if w < 0 {
+                    match errno() {
+                        libc::EINTR => continue,
+                        libc::EAGAIN => self.writable = false,
+                        e => return Err(io::Error::from_raw_os_error(e)),
+                    }
+                    break;
+                }
+                stats.shm_tx_bytes += w as u64;
+                bell |= s.tx.consume(w as usize);
+                if (w as usize) < n {
+                    self.writable = false;
+                }
+            }
+            while self.readable && !self.sock_eof && !self.guest_shut_rcv {
+                let (k, n) = s.rx.free_iov(&mut iov)?;
+                if n == 0 {
+                    break;
+                }
+                let r = unsafe { libc::readv(fd, iov.as_ptr(), k as i32) };
+                if r < 0 {
+                    match errno() {
+                        libc::EINTR => continue,
+                        libc::EAGAIN => self.readable = false,
+                        e => return Err(io::Error::from_raw_os_error(e)),
+                    }
+                    break;
+                }
+                if r == 0 {
+                    self.sock_eof = true;
+                    bell |= s.rx.close();
+                    break;
+                }
+                stats.shm_rx_bytes += r as u64;
+                bell |= s.rx.commit(r as usize);
+                if (r as usize) < n {
+                    self.readable = false;
+                }
+            }
+            // Out of ring data (or space) with the socket still ready: ask the
+            // agent for a doorbell, unless it raced us and there is work again.
+            let mut again = false;
+            if self.writable && !self.wr_shut && !s.tx.wait()? {
+                again = true;
+            }
+            if self.readable && !self.sock_eof && !self.guest_shut_rcv && !s.rx.wait()? {
+                again = true;
+            }
+            if !again {
+                return Ok(bell);
+            }
+        }
     }
 }
 
@@ -274,6 +376,10 @@ struct Stats {
     credit_updates: u64,
     tx_irqs: u64,
     rx_irqs: u64,
+    shm_tx_bytes: u64,
+    shm_rx_bytes: u64,
+    bells_in: u64,
+    bells_out: u64,
 }
 
 struct Dev {
@@ -294,6 +400,8 @@ struct Dev {
     ctl: VecDeque<Ctl>,
     rx_ready: HashSet<u64>,
     tx_ready: HashSet<u64>,
+    shm_ready: HashSet<u64>,
+    shm: Option<ShmTable>,
     segs: Vec<Seg>,
     iov: Vec<libc::iovec>,
 }
@@ -373,15 +481,6 @@ fn so_error(fd: RawFd) -> i32 {
     e
 }
 
-/// Bytes of offload request header needed given what has arrived so far.
-fn req_need(b: &[u8]) -> usize {
-    match b.get(4) {
-        None => 7,
-        Some(6) => 7 + 16,
-        Some(_) => 7 + 4,
-    }
-}
-
 type Mem = GuestMemoryMmap;
 
 /// Maps the descriptors of one chain. `writable` selects RX (device-writable)
@@ -456,6 +555,8 @@ impl Dev {
             ctl: VecDeque::new(),
             rx_ready: HashSet::new(),
             tx_ready: HashSet::new(),
+            shm_ready: HashSet::new(),
+            shm: None,
             segs: Vec::with_capacity(512),
             iov: Vec::with_capacity(512),
         })
@@ -469,6 +570,7 @@ impl Dev {
         self.poll_epoll();
         self.process_tx(&vrings[TXQ], mem)?;
         self.flush_tx_ready();
+        self.pump_shm_ready();
         self.process_rx(&vrings[RXQ], mem)?;
         self.print_stats();
         Ok(())
@@ -509,11 +611,18 @@ impl Dev {
                 }
                 if ev & (libc::EPOLLIN as u32 | libc::EPOLLRDHUP as u32 | hup) != 0 {
                     c.readable = true;
-                    self.rx_ready.insert(tok);
+                    if c.shm.is_none() {
+                        self.rx_ready.insert(tok);
+                    }
                 }
                 if ev & (libc::EPOLLOUT as u32 | hup) != 0 {
                     c.writable = true;
-                    self.tx_ready.insert(tok);
+                    if c.shm.is_none() {
+                        self.tx_ready.insert(tok);
+                    }
+                }
+                if c.shm.is_some() {
+                    self.shm_ready.insert(tok);
                 }
             }
             if (n as usize) < evs.len() {
@@ -553,7 +662,7 @@ impl Dev {
             }
             self.next_port = local.wrapping_add(1).max(FIRST_HOST_PORT);
             let mut c = Conn::new(local, self.guest_port, State::AwaitResponse);
-            c.prefix = Request::tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *gport)).encode();
+            c.prefix = Request::tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *gport), NO_SLOT).encode();
             let raw = fd.as_raw_fd();
             c.sock = Some(fd);
             let tok = self.add_conn(c);
@@ -567,6 +676,7 @@ impl Dev {
     }
 
     fn start_connect(&mut self, tok: u64, req: Request) {
+        self.conns.get_mut(&tok).unwrap().want_slot = req.slot;
         let res = if req.proto == PROTO_TCP {
             connect_nb(crate::map_dst(&self.aliases, req.dst)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
         } else {
@@ -597,13 +707,81 @@ impl Dev {
     }
 
     fn connected(&mut self, tok: u64) {
+        let want = self.conns[&tok].want_slot;
+        let slot = if self.attach_slot(tok, want) { want } else { NO_SLOT };
         let c = self.conns.get_mut(&tok).unwrap();
         c.state = State::Relay;
-        c.prefix.extend_from_slice(&0i32.to_be_bytes());
+        c.prefix.extend_from_slice(&proto::encode_status(0, slot));
         c.writable = true;
         c.readable = true;
         self.rx_ready.insert(tok);
         self.tx_ready.insert(tok);
+        self.shm_ready.insert(tok);
+    }
+
+    /// Registers the agent's rings, replacing (and resetting the connections
+    /// of) any earlier registration, e.g. from before a guest reboot.
+    fn register_shm(&mut self, r: &ShmRegion) -> Result<(), i32> {
+        let guard = self.mem.as_ref().ok_or(libc::ENODEV)?.memory();
+        let map = |gpa: u64, len: usize| -> Result<*mut u8, i32> {
+            let s = guard.get_slice(GuestAddress(gpa), len).map_err(|_| libc::EFAULT)?;
+            let p = s.ptr_guard_mut().as_ptr();
+            if !(p as usize).is_multiple_of(64) {
+                return Err(libc::EINVAL);
+            }
+            Ok(p)
+        };
+        let ctl = map(r.ctl_gpa, r.slots() * SLOT_CTL)?;
+        let rings = r.ring_gpas.iter().map(|&g| map(g, RING_SIZE)).collect::<Result<Vec<_>, _>>()?;
+        let old: Vec<u64> = self.conns.iter().filter(|(_, c)| c.shm.is_some()).map(|(&t, _)| t).collect();
+        for tok in old {
+            self.reset(tok);
+        }
+        self.shm = Some(ShmTable { _mem: guard.into_inner(), ctl, rings, in_use: vec![false; r.slots()] });
+        eprintln!("netd: shared rings registered ({} slots)", r.slots());
+        Ok(())
+    }
+
+    /// Binds `slot` of the registered rings to the connection.
+    fn attach_slot(&mut self, tok: u64, slot: u16) -> bool {
+        let Some(t) = self.shm.as_mut() else { return false };
+        let i = slot as usize;
+        if slot == NO_SLOT || i >= t.in_use.len() || t.in_use[i] {
+            return false;
+        }
+        t.in_use[i] = true;
+        // SAFETY: the control block and both rings were mapped and checked at
+        // registration and stay mapped while the table holds the memory.
+        let sc = unsafe {
+            let ctl = t.ctl.add(i * SLOT_CTL) as *const SlotCtl;
+            let g2h = Ring::new(&(*ctl).g2h, t.rings[2 * i]);
+            let h2g = Ring::new(&(*ctl).h2g, t.rings[2 * i + 1]);
+            ShmConn { slot, ctl, tx: Consumer::new(g2h), rx: Producer::new(h2g) }
+        };
+        self.conns.get_mut(&tok).unwrap().shm = Some(sc);
+        true
+    }
+
+    fn pump_shm_ready(&mut self) {
+        let toks: Vec<u64> = self.shm_ready.drain().collect();
+        for tok in toks {
+            let Some(c) = self.conns.get_mut(&tok) else { continue };
+            if c.state != State::Relay {
+                continue;
+            }
+            match c.pump_shm(&mut self.stats) {
+                Ok(bell) => {
+                    // One pending byte is enough to wake the agent.
+                    if bell && !c.guest_shut_rcv && c.prefix.is_empty() {
+                        c.prefix.push(0);
+                        self.stats.bells_out += 1;
+                        self.rx_ready.insert(tok);
+                    }
+                    self.check_done(tok);
+                }
+                Err(_) => self.reset(tok),
+            }
+        }
     }
 
     /// Reports a setup error to the guest agent; the agent then closes.
@@ -612,16 +790,22 @@ impl Dev {
         c.state = State::Failed;
         c.sock = None;
         c.txq.clear();
-        c.prefix.extend_from_slice(&err.to_be_bytes());
+        c.prefix.extend_from_slice(&proto::encode_status(err, NO_SLOT));
         self.rx_ready.insert(tok);
     }
 
     fn remove(&mut self, tok: u64) {
         if let Some(c) = self.conns.remove(&tok) {
             self.ports.remove(&(c.local_port, c.peer_port));
+            if let (Some(s), Some(t)) = (c.shm, self.shm.as_mut()) {
+                t.in_use[s.slot as usize] = false;
+                // SAFETY: mapped while the table lives; this is netd's last access.
+                unsafe { (*s.ctl).release() };
+            }
         }
         self.rx_ready.remove(&tok);
         self.tx_ready.remove(&tok);
+        self.shm_ready.remove(&tok);
     }
 
     fn reset(&mut self, tok: u64) {
@@ -647,6 +831,14 @@ impl Dev {
     /// Closes connections whose both directions are finished.
     fn check_done(&mut self, tok: u64) {
         let Some(c) = self.conns.get_mut(&tok) else { return };
+        if let Some(s) = &c.shm {
+            // EOF travels in the rings; the agent closes its vsock end when it
+            // is done, possibly leaving payload in the ring for netd to flush.
+            if c.guest_shut_send && c.guest_shut_rcv && (c.wr_shut || !matches!(s.tx.avail(), Ok(n) if n > 0)) {
+                self.reset(tok);
+            }
+            return;
+        }
         if !c.txq.is_empty() {
             return;
         }
@@ -787,6 +979,9 @@ impl Dev {
             OP_SHUTDOWN => {
                 c.guest_shut_send |= h.flags & SHUT_SEND != 0;
                 c.guest_shut_rcv |= h.flags & SHUT_RCV != 0;
+                if c.shm.is_some() {
+                    self.shm_ready.insert(tok);
+                }
                 self.check_done(tok);
             }
             OP_RST => self.remove(tok),
@@ -799,7 +994,7 @@ impl Dev {
         let c = self.conns.get_mut(&tok).unwrap();
         c.rx_cnt = c.rx_cnt.wrapping_add(len as u32);
         while len > 0 && matches!(c.state, State::ReadReq | State::AwaitStatus) {
-            let need = if c.state == State::ReadReq { req_need(&c.hs) } else { 4 };
+            let need = if c.state == State::ReadReq { Msg::need(&c.hs) } else { STATUS_LEN };
             let take = (need - c.hs.len()).min(len);
             let at = c.hs.len();
             c.hs.resize(at + take, 0);
@@ -811,32 +1006,51 @@ impl Dev {
                 continue;
             }
             if c.state == State::ReadReq {
-                if need == 7 {
-                    continue; // family byte known now; read the address
+                if Msg::need(&c.hs) > need {
+                    continue; // the prefix revealed more header to read
                 }
-                let parsed = Request::read_from(&mut c.hs.as_slice());
+                let parsed = Msg::parse(&c.hs);
                 c.hs.clear();
                 match parsed {
-                    Ok(req) => self.start_connect(tok, req),
+                    Ok(Msg::Connect(req)) => self.start_connect(tok, req),
+                    Ok(Msg::Shm(r)) => {
+                        let err = self.register_shm(&r).err().unwrap_or(0);
+                        let c = self.conns.get_mut(&tok).unwrap();
+                        c.state = State::Registration;
+                        c.prefix.extend_from_slice(&proto::encode_status(err, NO_SLOT));
+                        self.rx_ready.insert(tok);
+                    }
                     Err(_) => {
                         self.reset(tok);
                         return;
                     }
                 }
             } else {
-                let st = i32::from_be_bytes(c.hs[..4].try_into().unwrap());
+                let (st, slot) = proto::parse_status(c.hs[..STATUS_LEN].try_into().unwrap());
                 c.hs.clear();
-                if st != 0 {
+                if st != 0 || (slot != NO_SLOT && !self.attach_slot(tok, slot)) {
                     self.reset(tok);
                     return;
                 }
+                let c = self.conns.get_mut(&tok).unwrap();
                 c.state = State::Relay;
                 c.readable = true;
                 c.writable = true;
+                self.shm_ready.insert(tok);
             }
             break;
         }
         let Some(c) = self.conns.get_mut(&tok) else { return };
+        if c.shm.is_some() || c.state == State::Registration {
+            // Doorbells (or nothing at all): the payload is in the rings.
+            c.fwd_cnt = c.fwd_cnt.wrapping_add(len as u32);
+            if len > 0 && c.shm.is_some() {
+                self.stats.bells_in += 1;
+                self.shm_ready.insert(tok);
+            }
+            self.maybe_credit(tok);
+            return;
+        }
         if len > 0 && c.state == State::Relay && c.txq.is_empty() && c.writable {
             let fd = c.sock.as_ref().unwrap().as_raw_fd();
             self.iov.clear();
@@ -980,7 +1194,7 @@ impl Dev {
     fn rx_conn(&mut self, tok: u64, st: &mut VState, mem: &Mem, used: &mut bool) -> Rx {
         let Some(c) = self.conns.get(&tok) else { return Rx::Idle };
         let credit = c.peer_credit();
-        if !c.prefix.is_empty() && matches!(c.state, State::AwaitStatus | State::Relay | State::Failed) {
+        if !c.prefix.is_empty() && matches!(c.state, State::AwaitStatus | State::Relay | State::Failed | State::Registration) {
             if credit == 0 {
                 return Rx::Idle;
             }
@@ -1004,7 +1218,7 @@ impl Dev {
             c.last_fwd_sent = c.fwd_cnt;
             return Rx::Sent;
         }
-        if c.state != State::Relay || !c.readable || c.sock_eof || c.guest_shut_rcv || credit == 0 {
+        if c.state != State::Relay || c.shm.is_some() || !c.readable || c.sock_eof || c.guest_shut_rcv || credit == 0 {
             return Rx::Idle;
         }
         let fd = c.sock.as_ref().unwrap().as_raw_fd();
@@ -1205,10 +1419,4 @@ mod tests {
         assert_eq!(&b[..3], b"llo");
     }
 
-    #[test]
-    fn request_length() {
-        assert_eq!(req_need(b"ND"), 7);
-        assert_eq!(req_need(b"ND\x01\x06\x04\x00\x50"), 11);
-        assert_eq!(req_need(b"ND\x01\x06\x06\x00\x50"), 23);
-    }
 }

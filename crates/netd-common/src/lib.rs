@@ -4,4 +4,5 @@
 
 pub mod proto;
 pub mod relay;
+pub mod shm;
 pub mod sock;
