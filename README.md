@@ -45,7 +45,7 @@ socket is in a bulk transfer and sleeps until the peer has freed half the
 ring, rather than taking CPU from the peer that has to make room. Payload
 is published in chunks of up to 256 KiB guest-to-host or 512 KiB
 host-to-guest, so both sides copy at the same time. The host can combine
-published guest-to-host chunks into a 512 KiB socket write.
+published guest-to-host chunks into a 1 MiB socket write.
 
 Connection setup avoids round trips too. Each ring slot has one persistent
 vsock stream, opened when the rings are registered, and the slot's

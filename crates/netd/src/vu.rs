@@ -60,7 +60,7 @@ const BUF_ALLOC: u32 = 4 << 20;
 /// Upper bound of host->guest bytes moved by one readv.
 const RX_BATCH: usize = 1 << 20;
 /// Maximum guest-to-host ring data submitted in one socket write.
-const SHM_TX_BATCH: usize = RING_SIZE / 4;
+const SHM_TX_BATCH: usize = RING_SIZE / 2;
 const LISTENER_BIT: u64 = 1 << 63;
 /// epoll token of the eventfd the worker uses to reschedule itself.
 const YIELD_TOK: u64 = 0;
@@ -1703,7 +1703,7 @@ mod tests {
         let h2g = unsafe { Ring::new(&ctl.h2g, h2g_data.as_mut_ptr()) };
         let mut guest = Producer::new(g2h);
         let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
-        for _ in 0..2 {
+        for _ in 0..4 {
             let (_, n) = guest.free_iov(&mut iov, netd_common::shm::CHUNK).unwrap();
             unsafe { std::ptr::write_bytes(iov[0].iov_base, 7, n) };
             guest.commit(n);
