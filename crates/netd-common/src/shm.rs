@@ -21,6 +21,7 @@
 //! validated before use and all accesses stay inside the registered ring.
 
 use std::io;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 pub const HUGEPAGE: usize = 2 << 20;
@@ -92,6 +93,34 @@ impl SlotCtl {
 
 fn corrupt() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "shared ring corrupted")
+}
+
+/// Reads into one or two ring segments.
+///
+/// # Safety
+/// Every iovec must refer to writable memory valid for the duration of the call.
+#[inline]
+pub unsafe fn read_segments(fd: RawFd, iov: &[libc::iovec]) -> isize {
+    assert!(iov.len() <= 2);
+    if let [segment] = iov {
+        unsafe { libc::read(fd, segment.iov_base, segment.iov_len) }
+    } else {
+        unsafe { libc::readv(fd, iov.as_ptr(), iov.len() as i32) }
+    }
+}
+
+/// Writes from one or two ring segments.
+///
+/// # Safety
+/// Every iovec must refer to readable memory valid for the duration of the call.
+#[inline]
+pub unsafe fn write_segments(fd: RawFd, iov: &[libc::iovec]) -> isize {
+    assert!(iov.len() <= 2);
+    if let [segment] = iov {
+        unsafe { libc::write(fd, segment.iov_base, segment.iov_len) }
+    } else {
+        unsafe { libc::writev(fd, iov.as_ptr(), iov.len() as i32) }
+    }
 }
 
 /// One ring: its control block and RING_SIZE bytes of data.
@@ -254,6 +283,9 @@ impl Consumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
 
     struct Mem {
         ctl: Box<SlotCtl>,
@@ -327,5 +359,32 @@ mod tests {
         m.ctl.g2h.head.0.store(5, Ordering::Relaxed);
         assert!(p.space().is_err());
         let _ = &m.data;
+    }
+
+    #[test]
+    fn segment_io_handles_contiguous_wrapped_and_empty_socket() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        for count in [1, 2] {
+            let mut first = [0u8; 3];
+            let mut second = [0u8; 2];
+            let iov = [
+                libc::iovec { iov_base: first.as_mut_ptr().cast(), iov_len: first.len() },
+                libc::iovec { iov_base: second.as_mut_ptr().cast(), iov_len: second.len() },
+            ];
+            let expected = if count == 1 { &b"abc"[..] } else { &b"abcde"[..] };
+            peer.write_all(expected).unwrap();
+            assert_eq!(unsafe { read_segments(socket.as_raw_fd(), &iov[..count]) }, expected.len() as isize);
+            assert_eq!(&first, b"abc");
+            if count == 2 {
+                assert_eq!(&second, b"de");
+            }
+            assert_eq!(unsafe { read_segments(socket.as_raw_fd(), &iov[..count]) }, -1);
+            assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(unsafe { write_segments(socket.as_raw_fd(), &iov[..count]) }, expected.len() as isize);
+            let mut actual = vec![0; expected.len()];
+            peer.read_exact(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 }

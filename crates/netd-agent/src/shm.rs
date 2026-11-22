@@ -25,7 +25,7 @@ const STARTUP_LIMIT: u64 = 256 * 1024;
 struct Counters {
     reads: u64,
     bytes_in: u64,
-    /// readv found the ring full / the application socket empty.
+    /// Reads found the ring full / the application socket empty.
     ring_full: u64,
     app_empty: u64,
     writes: u64,
@@ -296,7 +296,7 @@ fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Result of one non-blocking readv/writev.
+/// Result of one non-blocking socket read or write.
 enum Io {
     Done(usize),
     Blocked,
@@ -399,7 +399,7 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Optio
                 cnt.ring_full += 1;
                 break;
             }
-            match io_result(unsafe { libc::readv(t, iov.as_ptr(), k as i32) })? {
+            match io_result(unsafe { netd_common::shm::read_segments(t, &iov[..k]) })? {
                 Io::Done(0) => {
                     app_eof = true;
                     eof_bell = tx.close();
@@ -435,7 +435,7 @@ fn pump_loop(t: RawFd, v: RawFd, tx: &mut Producer, rx: &mut Consumer, id: Optio
                 }
                 break;
             }
-            match io_result(unsafe { libc::writev(t, iov.as_ptr(), k as i32) })? {
+            match io_result(unsafe { netd_common::shm::write_segments(t, &iov[..k]) })? {
                 Io::Done(w) => {
                     cnt.writes += 1;
                     cnt.bytes_out += w as u64;

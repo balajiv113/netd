@@ -329,7 +329,7 @@ impl Conn {
                     }
                     break;
                 }
-                let w = unsafe { libc::writev(fd, iov.as_ptr(), k as i32) };
+                let w = unsafe { netd_common::shm::write_segments(fd, &iov[..k]) };
                 if w < 0 {
                     match errno() {
                         libc::EINTR => continue,
@@ -357,7 +357,7 @@ impl Conn {
                     stats.shm_rx_ring_full += 1;
                     break;
                 }
-                let r = unsafe { libc::readv(fd, iov.as_ptr(), k as i32) };
+                let r = unsafe { netd_common::shm::read_segments(fd, &iov[..k]) };
                 if r < 0 {
                     match errno() {
                         libc::EINTR => continue,
