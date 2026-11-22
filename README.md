@@ -85,6 +85,13 @@ Percentages are given against `native` (host loopback, unrestricted) and
 `native-cpu` (host loopback pinned to as many CPUs as the guest has vCPUs),
 the fairer bound when the runner has few cores.
 
+For CPU diagnosis, the GitHub workflow's optional `profile` input samples
+the netd process separately during each throughput and latency test. Reports
+and raw `perf` data are uploaded as artifacts. Profiling adds overhead, so
+do not use those runs to judge benchmark improvements. Enabling profiling in
+CI installs Linux `perf` and changes kernel profiling permissions on the
+runner; netd itself does not require those permissions.
+
 ## Prototype limitations
 
 * TCP only (no UDP/ICMP/DNS yet); IPv4 destinations exercised by the benchmark.

@@ -15,6 +15,11 @@ on:
         description: "iperf3 seconds per test"
         required: false
         default: "10"
+      profile:
+        description: "sample netd CPU during each benchmark phase (adds overhead)"
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths: ["crates/**", "bench/**", ".github/workflows/bench.yml"]
@@ -69,7 +74,17 @@ jobs:
           chmod +x "$RUNNER_TEMP/gvproxy"
           echo "GVPROXY=$RUNNER_TEMP/gvproxy" >> "$GITHUB_ENV"
 
+      - name: Install CPU profiler
+        if: github.event.inputs.profile == 'true'
+        run: |
+          sudo apt-get install -y -qq "linux-tools-$(uname -r)"
+          sudo sysctl -w kernel.perf_event_paranoid=-1
+          sudo sysctl -w kernel.kptr_restrict=0
+          perf --version
+
       - name: Build netd
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: ${{ github.event.inputs.profile == 'true' && '1' || '0' }}
         run: |
           cargo build --release
 
@@ -97,7 +112,15 @@ jobs:
         run: bench/provision.sh
 
       - name: Run benchmark
-        run: python3 bench/run.py ${{ github.event.inputs.contenders }} --secs ${{ github.event.inputs.secs || '10' }}
+        env:
+          NETD_PROFILE: ${{ github.event.inputs.profile == 'true' && '1' || '0' }}
+        run: |
+          python3 bench/run.py ${{ github.event.inputs.contenders }} --secs ${{ github.event.inputs.secs || '10' }}
+          if [ "$NETD_PROFILE" = 1 ]; then
+            for phase in up1 down1 up4 down4 rr crr; do
+              test -s "bench/work/netd-$phase-perf-report.log"
+            done
+          fi
 
       - name: Upload results
         if: always()
@@ -108,3 +131,4 @@ jobs:
             bench/work/*.json
             bench/work/*.md
             bench/work/*.log
+            bench/work/*.perf.data

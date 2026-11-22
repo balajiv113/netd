@@ -19,11 +19,13 @@ guest network.
 
 import argparse
 import base64
+from contextlib import contextmanager
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -407,6 +409,40 @@ def iperf_args(target, port, extra, secs):
 THROUGHPUT = {"up1": [], "down1": ["-R"], "up4": ["-P", "4"], "down4": ["-R", "-P", "4"]}
 
 
+@contextmanager
+def profile_cpu(tag, phase, pid):
+    """Optionally sample netd CPU during a single benchmark phase."""
+    if os.environ.get("NETD_PROFILE") != "1" or pid is None:
+        yield
+        return
+    perf = os.environ.get("NETD_PERF", "perf")
+    data = W / f"{tag}-{phase}.perf.data"
+    record_log = W / f"{tag}-{phase}-perf-record.log"
+    report_log = W / f"{tag}-{phase}-perf-report.log"
+    with record_log.open("w") as log_file:
+        proc = subprocess.Popen([perf, "record", "-e", "cpu-clock", "-F", "99", "--call-graph", "dwarf,8192",
+                                 "-p", str(pid), "-o", str(data)], stdout=log_file, stderr=subprocess.STDOUT)
+        time.sleep(0.25)
+        if proc.poll() is not None:
+            raise RuntimeError(f"perf exited during startup; see {record_log}")
+        try:
+            yield
+        finally:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+            try:
+                status = proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise RuntimeError(f"perf did not stop; see {record_log}")
+            if status != 0:
+                raise RuntimeError(f"perf exited with {status}; see {record_log}")
+    with report_log.open("w") as out:
+        subprocess.run([perf, "report", "--stdio", "--no-children", "--no-call-graph", "-i", str(data)],
+                       stdout=out, stderr=subprocess.STDOUT, check=True)
+
+
 def measure(fn, pids):
     before = {p: cpu_seconds(p) for p in pids}
     t = time.time()
@@ -494,6 +530,7 @@ def run_contender(name, args):
         pids = {"qemu": qp.pid}
         for i, p in enumerate(c.helpers()):
             pids[f"{Path(p.args[0]).name}"] = p.pid
+        profile_pid = pids.get("netd") if base == "netd" else None
 
         for t, extra in THROUGHPUT.items():
             def go():
@@ -502,11 +539,14 @@ def run_contender(name, args):
                 return iperf_gbps(out or err)
             try:
                 s0 = guest_cpu_sample(g)
-                v, cpu = measure(go, list(pids.values()))
+                with profile_cpu(tag, t, profile_pid):
+                    v, cpu = measure(go, list(pids.values()))
                 res[t] = v
                 res[t + "_cpu"] = {k: cpu[p] for k, p in pids.items()}
                 res[t + "_guest_cpu"] = guest_cpu_delta(s0, guest_cpu_sample(g))
             except Exception as e:  # keep going; record the failure
+                if os.environ.get("NETD_PROFILE") == "1" and profile_pid is not None:
+                    raise
                 res[t] = None
                 res[t + "_error"] = str(e)[:300]
             log(f"[{name}] {t}: {res[t]}")
@@ -514,7 +554,8 @@ def run_contender(name, args):
 
         for t, argv in {"rr": ["rr", f"{c.host_ip}:{NBENCH_PORT}", "20000"],
                         "crr": ["crr", f"{c.host_ip}:{NBENCH_PORT}", "5"]}.items():
-            rc, out, err = g.run(["timeout", "-k", "5", "60", "/usr/local/bin/nbench"] + argv, timeout=80, check=False)
+            with profile_cpu(tag, t, profile_pid):
+                rc, out, err = g.run(["timeout", "-k", "5", "60", "/usr/local/bin/nbench"] + argv, timeout=80, check=False)
             try:
                 res[t] = json.loads(out)
             except ValueError:
