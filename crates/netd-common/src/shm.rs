@@ -168,7 +168,10 @@ impl Producer {
         // Paired with Consumer::wait: publication and arming cannot both
         // miss each other, even when the exchange is skipped.
         fence(Ordering::SeqCst);
-        c.cons_wait.0.load(Ordering::Relaxed) != 0 && c.cons_wait.0.swap(0, Ordering::Relaxed) != 0
+        if n >= CHUNK / 4 && c.cons_wait.0.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        c.cons_wait.0.swap(0, Ordering::Relaxed) != 0
     }
 
     /// Marks the end of the stream. Returns true if the consumer must be woken.
@@ -333,6 +336,11 @@ mod tests {
 
     #[test]
     fn publication_racing_consumer_wait_cannot_lose_wakeup() {
+        race_publication(1);
+        race_publication(CHUNK);
+    }
+
+    fn race_publication(n: usize) {
         let (_m, mut producer, mut consumer) = ring();
         let barrier = std::sync::Barrier::new(2);
         let woke = std::sync::atomic::AtomicBool::new(false);
@@ -340,7 +348,7 @@ mod tests {
             scope.spawn(|| {
                 for _ in 0..10_000 {
                     barrier.wait();
-                    woke.store(producer.commit(1), Ordering::SeqCst);
+                    woke.store(producer.commit(n), Ordering::SeqCst);
                     barrier.wait();
                     barrier.wait();
                 }
@@ -350,8 +358,8 @@ mod tests {
                 let waiting = consumer.wait().unwrap();
                 barrier.wait();
                 assert!(!waiting || woke.load(Ordering::SeqCst));
-                assert_eq!(consumer.avail().unwrap(), 1);
-                consumer.consume(1);
+                assert_eq!(consumer.avail().unwrap(), n);
+                consumer.consume(n);
                 barrier.wait();
             }
         });
@@ -367,6 +375,21 @@ mod tests {
         assert!(p.commit(1));
         assert!(!p.commit(1));
         c.consume(2);
+        assert!(c.wait().unwrap());
+        assert!(p.close());
+        assert!(c.finished().unwrap());
+    }
+
+    #[test]
+    fn large_publication_notifies_only_armed_consumer() {
+        let (_m, mut p, mut c) = ring();
+        assert!(!p.commit(CHUNK));
+        assert!(!c.wait().unwrap());
+        c.consume(CHUNK);
+        assert!(c.wait().unwrap());
+        assert!(p.commit(CHUNK));
+        assert!(!p.commit(CHUNK));
+        c.consume(2 * CHUNK);
         assert!(c.wait().unwrap());
         assert!(p.close());
         assert!(c.finished().unwrap());
