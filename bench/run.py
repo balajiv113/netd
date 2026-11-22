@@ -428,19 +428,26 @@ def profile_cpu(tag, phase, pid):
         try:
             yield
         finally:
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGINT)
+            if proc.poll() is not None:
+                raise RuntimeError(f"perf exited during benchmark; see {record_log}")
+            proc.send_signal(signal.SIGINT)
             try:
                 status = proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
                 raise RuntimeError(f"perf did not stop; see {record_log}")
-            if status != 0:
+            if status not in (0, -signal.SIGINT):
                 raise RuntimeError(f"perf exited with {status}; see {record_log}")
+    if not data.is_file() or data.stat().st_size == 0:
+        raise RuntimeError(f"perf produced no data; see {record_log}")
     with report_log.open("w") as out:
         subprocess.run([perf, "report", "--stdio", "--no-children", "--no-call-graph", "-i", str(data)],
                        stdout=out, stderr=subprocess.STDOUT, check=True)
+    samples = re.search(r"(?m)^# Samples:\s+([0-9][0-9,.]*)(?:[KMB])?\s+of event\b",
+                        report_log.read_text())
+    if samples is None or float(samples.group(1).replace(",", "")) == 0:
+        raise RuntimeError(f"perf report contains no samples; see {report_log}")
 
 
 def measure(fn, pids):
