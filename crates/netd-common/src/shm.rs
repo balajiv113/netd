@@ -165,8 +165,10 @@ impl Producer {
         self.tail = self.tail.wrapping_add(n as u64);
         let c = self.ring.ctl();
         c.tail.0.store(self.tail, Ordering::Release);
+        // Paired with Consumer::wait: publication and arming cannot both
+        // miss each other, even when the exchange is skipped.
         fence(Ordering::SeqCst);
-        c.cons_wait.0.swap(0, Ordering::Relaxed) != 0
+        c.cons_wait.0.load(Ordering::Relaxed) != 0 && c.cons_wait.0.swap(0, Ordering::Relaxed) != 0
     }
 
     /// Marks the end of the stream. Returns true if the consumer must be woken.
@@ -327,5 +329,46 @@ mod tests {
         m.ctl.g2h.head.0.store(5, Ordering::Relaxed);
         assert!(p.space().is_err());
         let _ = &m.data;
+    }
+
+    #[test]
+    fn publication_racing_consumer_wait_cannot_lose_wakeup() {
+        let (_m, mut producer, mut consumer) = ring();
+        let barrier = std::sync::Barrier::new(2);
+        let woke = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..10_000 {
+                    barrier.wait();
+                    woke.store(producer.commit(1), Ordering::SeqCst);
+                    barrier.wait();
+                    barrier.wait();
+                }
+            });
+            for _ in 0..10_000 {
+                barrier.wait();
+                let waiting = consumer.wait().unwrap();
+                barrier.wait();
+                assert!(!waiting || woke.load(Ordering::SeqCst));
+                assert_eq!(consumer.avail().unwrap(), 1);
+                consumer.consume(1);
+                barrier.wait();
+            }
+        });
+    }
+
+    #[test]
+    fn producer_notifies_only_armed_consumer() {
+        let (_m, mut p, mut c) = ring();
+        assert!(!p.commit(1));
+        assert!(!c.wait().unwrap());
+        c.consume(1);
+        assert!(c.wait().unwrap());
+        assert!(p.commit(1));
+        assert!(!p.commit(1));
+        c.consume(2);
+        assert!(c.wait().unwrap());
+        assert!(p.close());
+        assert!(c.finished().unwrap());
     }
 }

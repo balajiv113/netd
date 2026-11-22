@@ -20,6 +20,12 @@ on:
     paths: ["crates/**", "bench/**", ".github/workflows/bench.yml"]
 
 jobs:
+  ring-arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test -p netd-common publication_racing_consumer_wait_cannot_lose_wakeup
+
   test:
     runs-on: ubuntu-24.04
     steps:
