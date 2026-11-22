@@ -811,7 +811,7 @@ impl Dev {
 
     fn start_connect(&mut self, tok: u64, req: Request) {
         let res = if req.proto == PROTO_TCP {
-            connect_nb(crate::map_dst(&self.aliases, req.dst)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+            connect_nb(super::map_dst(&self.aliases, req.dst)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
         } else {
             Err(libc::EPROTONOSUPPORT)
         };

@@ -57,6 +57,21 @@ costs no vsock stream setup or teardown, only a few frames. When no slot is
 free (or shm is off) the agent falls back to its `--pool N` (default 4) of
 per-connection vsock streams.
 
+## Experimental VM-to-VM Ethernet switch
+
+`netd switch --listen 127.0.0.1:12345` runs an unprivileged Ethernet switch.
+Connect QEMU guests with `-netdev socket,id=n0,connect=127.0.0.1:12345
+-device virtio-net-pci,netdev=n0,mac=52:54:00:00:00:01`, using a different MAC
+address for each guest. Configure guest addresses manually; this mode currently
+provides no DHCP, DNS, gateway, internet access or port forwarding.
+
+The TCP listener accepts connections from any local user and does not
+authenticate ports or isolate guests. Only use it with trusted local users and
+VMs. Its bounded queues can drop frames under load. The switch is a portable
+prototype; it does not yet support the native Virtualization.framework or
+Hyper-V adapters. `bash bench/vmtest/switch.sh` tests two QEMU Linux guests;
+run `bash bench/vmtest/vmtest.sh` first to populate the guest kernel cache.
+
 ## Crates
 
 | crate | purpose |
