@@ -51,6 +51,9 @@ power_state:
   mode: poweroff
   condition: true
 EOF
+if [ "${NETD_GUEST_PROFILE:-0}" = 1 ]; then
+  sed -i 's/packages: \[iperf3, qemu-guest-agent, iptables\]/packages: [iperf3, qemu-guest-agent, iptables, linux-tools-generic]/' "$W/user-data"
+fi
 printf 'instance-id: netd-bench\nlocal-hostname: bench\n' >"$W/meta-data"
 cloud-localds "$W/seed.img" "$W/user-data" "$W/meta-data"
 

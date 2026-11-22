@@ -1,3 +1,4 @@
+import base64
 import os
 from pathlib import Path
 import signal
@@ -83,6 +84,62 @@ class ProfileCpuTest(unittest.TestCase):
         run.subprocess.run.side_effect = subprocess.CalledProcessError(1, "perf")
         with self.assertRaises(subprocess.CalledProcessError):
             with run.profile_cpu("netd", "up1", 123):
+                pass
+
+
+class GuestProfileTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.work = Path(self.tmp.name)
+        self.patches = [mock.patch.object(run, "W", self.work), mock.patch.object(run.time, "sleep")]
+        for patch in self.patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.guest = mock.Mock()
+        self.guest.run.return_value = (0, "# Samples: 42 of event 'cpu-clock'\n", "")
+        self.statuses = iter([{"exited": False}, {"exited": False},
+                              {"exited": True, "signal": signal.SIGINT,
+                               "err-data": base64.b64encode(b"recorded").decode()}])
+        self.guest.cmd.side_effect = self.cmd
+
+    def cmd(self, name, args):
+        if name == "guest-exec":
+            return {"pid": 42}
+        if name == "guest-exec-status":
+            return next(self.statuses)
+        if name == "guest-file-open":
+            return 7
+        if name == "guest-file-read":
+            return {"buf-b64": base64.b64encode(b"data").decode(), "eof": True}
+        if name == "guest-file-close":
+            return {}
+        self.fail(f"unexpected command: {name}")
+
+    def test_guest_sigint_and_data_copy(self):
+        with run.profile_guest(self.guest, "netd", "up1", "/perf"):
+            pass
+        self.assertEqual((self.work / "netd-up1-guest.perf.data").read_bytes(), b"data")
+        self.assertEqual((self.work / "netd-up1-guest-perf-record.log").read_bytes(), b"recorded")
+        self.guest.run.assert_any_call(["kill", "-INT", "42"])
+        self.guest.cmd.assert_any_call("guest-file-close", {"handle": 7})
+
+    def test_guest_early_exit_is_rejected(self):
+        self.statuses = iter([{"exited": False}, {"exited": True, "exitcode": 0}])
+        with self.assertRaisesRegex(RuntimeError, "during benchmark"):
+            with run.profile_guest(self.guest, "netd", "up1", "/perf"):
+                pass
+
+    def test_guest_failure_is_rejected(self):
+        self.statuses = iter([{"exited": False}, {"exited": False}, {"exited": True, "exitcode": 1}])
+        with self.assertRaisesRegex(RuntimeError, "guest perf failed"):
+            with run.profile_guest(self.guest, "netd", "up1", "/perf"):
+                pass
+
+    def test_guest_empty_report_is_rejected(self):
+        self.guest.run.return_value = (0, "# Samples: 0 of event 'cpu-clock'\n", "")
+        with self.assertRaisesRegex(RuntimeError, "no samples"):
+            with run.profile_guest(self.guest, "netd", "up1", "/perf"):
                 pass
 
 

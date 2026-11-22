@@ -91,6 +91,9 @@ and raw `perf` data are uploaded as artifacts. Profiling adds overhead, so
 do not use those runs to judge benchmark improvements. Enabling profiling in
 CI installs Linux `perf` and changes kernel profiling permissions on the
 runner; netd itself does not require those permissions.
+The separate `guest_profile` input samples all guest CPUs and uploads
+per-phase reports and data. It installs Linux perf tools in the benchmark
+guest and adds overhead; it is also diagnostic rather than an A/B result.
 
 ## Prototype limitations
 

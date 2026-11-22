@@ -409,6 +409,12 @@ def iperf_args(target, port, extra, secs):
 THROUGHPUT = {"up1": [], "down1": ["-R"], "up4": ["-P", "4"], "down4": ["-R", "-P", "4"]}
 
 
+def check_perf_report(text, path):
+    samples = re.search(r"(?m)^# Samples:\s+([0-9][0-9,.]*)(?:[KMB])?\s+of event\b", text)
+    if samples is None or float(samples.group(1).replace(",", "")) == 0:
+        raise RuntimeError(f"perf report contains no samples; see {path}")
+
+
 @contextmanager
 def profile_cpu(tag, phase, pid):
     """Optionally sample netd CPU during a single benchmark phase."""
@@ -444,10 +450,67 @@ def profile_cpu(tag, phase, pid):
     with report_log.open("w") as out:
         subprocess.run([perf, "report", "--stdio", "--no-children", "--no-call-graph", "-i", str(data)],
                        stdout=out, stderr=subprocess.STDOUT, check=True)
-    samples = re.search(r"(?m)^# Samples:\s+([0-9][0-9,.]*)(?:[KMB])?\s+of event\b",
-                        report_log.read_text())
-    if samples is None or float(samples.group(1).replace(",", "")) == 0:
-        raise RuntimeError(f"perf report contains no samples; see {report_log}")
+    check_perf_report(report_log.read_text(), report_log)
+
+
+def copy_guest_file(g, source, destination):
+    handle = g.cmd("guest-file-open", {"path": source, "mode": "r"})
+    try:
+        with destination.open("wb") as out:
+            while True:
+                part = g.cmd("guest-file-read", {"handle": handle, "count": 131072})
+                chunk = base64.b64decode(part["buf-b64"])
+                out.write(chunk)
+                if part["eof"]:
+                    break
+                if not chunk:
+                    raise RuntimeError(f"guest file read made no progress: {source}")
+    finally:
+        g.cmd("guest-file-close", {"handle": handle})
+    if destination.stat().st_size == 0:
+        raise RuntimeError(f"guest perf produced no data: {source}")
+
+
+@contextmanager
+def profile_guest(g, tag, phase, perf):
+    """Optionally sample both guest CPUs during one benchmark phase."""
+    if perf is None:
+        yield
+        return
+    guest_data = f"/tmp/netd-{phase}-guest.perf.data"
+    data = W / f"{tag}-{phase}-guest.perf.data"
+    record_log = W / f"{tag}-{phase}-guest-perf-record.log"
+    report_log = W / f"{tag}-{phase}-guest-perf-report.log"
+    pid = g.cmd("guest-exec", {"path": perf, "arg": ["record", "-a", "-e", "cpu-clock", "-F", "99",
+                                                        "-o", guest_data], "capture-output": True})["pid"]
+    time.sleep(0.5)
+    status = g.cmd("guest-exec-status", {"pid": pid})
+    if status.get("exited"):
+        raise RuntimeError(f"guest perf exited during startup for {phase}: {status}")
+    try:
+        yield
+    finally:
+        status = g.cmd("guest-exec-status", {"pid": pid})
+        if status.get("exited"):
+            raise RuntimeError(f"guest perf exited during benchmark for {phase}: {status}")
+        g.run(["kill", "-INT", str(pid)])
+        deadline = time.monotonic() + 15
+        while True:
+            status = g.cmd("guest-exec-status", {"pid": pid})
+            if status.get("exited"):
+                break
+            if time.monotonic() >= deadline:
+                g.run(["kill", "-KILL", str(pid)], check=False)
+                raise RuntimeError(f"guest perf did not stop for {phase}")
+            time.sleep(0.1)
+        record_log.write_bytes(base64.b64decode(status.get("out-data", "")) +
+                               base64.b64decode(status.get("err-data", "")))
+        if status.get("exitcode") != 0 and status.get("signal") != signal.SIGINT:
+            raise RuntimeError(f"guest perf failed for {phase}: {status}; see {record_log}")
+    _, report, _ = g.run([perf, "report", "--stdio", "--no-children", "--no-call-graph", "-i", guest_data])
+    report_log.write_text(report)
+    check_perf_report(report, report_log)
+    copy_guest_file(g, guest_data, data)
 
 
 def measure(fn, pids):
@@ -538,6 +601,12 @@ def run_contender(name, args):
         for i, p in enumerate(c.helpers()):
             pids[f"{Path(p.args[0]).name}"] = p.pid
         profile_pid = pids.get("netd") if base == "netd" else None
+        guest_perf = None
+        if os.environ.get("NETD_GUEST_PROFILE") == "1" and base == "netd":
+            _, guest_perf, _ = g.run(["/bin/sh", "-c",
+                                      "p=$(find /usr/lib -maxdepth 2 -type f -path '/usr/lib/linux-tools-*/perf' | head -n 1); "
+                                      "test -x \"$p\" && printf '%s' \"$p\""])
+            g.run([guest_perf, "--version"])
 
         for t, extra in THROUGHPUT.items():
             def go():
@@ -546,13 +615,13 @@ def run_contender(name, args):
                 return iperf_gbps(out or err)
             try:
                 s0 = guest_cpu_sample(g)
-                with profile_cpu(tag, t, profile_pid):
+                with profile_cpu(tag, t, profile_pid), profile_guest(g, tag, t, guest_perf):
                     v, cpu = measure(go, list(pids.values()))
                 res[t] = v
                 res[t + "_cpu"] = {k: cpu[p] for k, p in pids.items()}
                 res[t + "_guest_cpu"] = guest_cpu_delta(s0, guest_cpu_sample(g))
             except Exception as e:  # keep going; record the failure
-                if os.environ.get("NETD_PROFILE") == "1" and profile_pid is not None:
+                if (os.environ.get("NETD_PROFILE") == "1" and profile_pid is not None) or guest_perf is not None:
                     raise
                 res[t] = None
                 res[t + "_error"] = str(e)[:300]
@@ -561,7 +630,7 @@ def run_contender(name, args):
 
         for t, argv in {"rr": ["rr", f"{c.host_ip}:{NBENCH_PORT}", "20000"],
                         "crr": ["crr", f"{c.host_ip}:{NBENCH_PORT}", "5"]}.items():
-            with profile_cpu(tag, t, profile_pid):
+            with profile_cpu(tag, t, profile_pid), profile_guest(g, tag, t, guest_perf):
                 rc, out, err = g.run(["timeout", "-k", "5", "60", "/usr/local/bin/nbench"] + argv, timeout=80, check=False)
             try:
                 res[t] = json.loads(out)

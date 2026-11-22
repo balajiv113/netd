@@ -20,6 +20,11 @@ on:
         required: false
         type: boolean
         default: false
+      guest_profile:
+        description: "sample guest CPUs during each netd benchmark phase (adds overhead)"
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths: ["crates/**", "bench/**", ".github/workflows/bench.yml"]
@@ -84,7 +89,7 @@ jobs:
 
       - name: Build netd
         env:
-          CARGO_PROFILE_RELEASE_DEBUG: ${{ github.event.inputs.profile == 'true' && '1' || '0' }}
+          CARGO_PROFILE_RELEASE_DEBUG: ${{ (github.event.inputs.profile == 'true' || github.event.inputs.guest_profile == 'true') && '1' || '0' }}
         run: |
           cargo build --release
 
@@ -109,16 +114,24 @@ jobs:
           key: noble-cloudimg-v1
 
       - name: Provision guest image
+        env:
+          NETD_GUEST_PROFILE: ${{ github.event.inputs.guest_profile == 'true' && '1' || '0' }}
         run: bench/provision.sh
 
       - name: Run benchmark
         env:
           NETD_PROFILE: ${{ github.event.inputs.profile == 'true' && '1' || '0' }}
+          NETD_GUEST_PROFILE: ${{ github.event.inputs.guest_profile == 'true' && '1' || '0' }}
         run: |
           python3 bench/run.py ${{ github.event.inputs.contenders }} --secs ${{ github.event.inputs.secs || '10' }}
           if [ "$NETD_PROFILE" = 1 ]; then
             for phase in up1 down1 up4 down4 rr crr; do
               test -s "bench/work/netd-$phase-perf-report.log"
+            done
+          fi
+          if [ "$NETD_GUEST_PROFILE" = 1 ]; then
+            for phase in up1 down1 up4 down4 rr crr; do
+              test -s "bench/work/netd-$phase-guest-perf-report.log"
             done
           fi
 
